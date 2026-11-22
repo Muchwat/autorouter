@@ -32,6 +32,9 @@ usage: autorouter BOARD.kicad_pcb [options]
                          go right through the board)
       --blind-vias       any blind or buried via: every pair of layers
       --via-in-pad       let vias sit on surface-mount pads of their own net
+      --no-fanout        do not bring out pads the grid cannot reach (the inner balls of
+                         a BGA, tight fine-pitch pads) with an escape track or a via
+      --fanout-length MM how far from its pad a fan-out may end (default 2)
       --neck MM          width a track narrows to where it is too wide to reach a pad
                          (default: the Default class's width, or the rules' minimum if more)
       --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
@@ -214,6 +217,8 @@ fn main() {
             "--layers" => layer_names = Some(list(&value(&mut i, &a))),
             "--via-spans" => span_names.extend(list(&value(&mut i, &a))),
             "--blind-vias" => any_span = true,
+            "--no-fanout" => opt.fanout = false,
+            "--fanout-length" => opt.fanout_length = mm(&value(&mut i, &a), &a),
             "--grid" => opt.grid = mm(&value(&mut i, &a), &a),
             "--margin" => {
                 opt.margin = value(&mut i, &a)
@@ -497,6 +502,49 @@ fn main() {
             }
         );
     }
+    if !result.fanouts.is_empty() {
+        let vias = result.fanouts.iter().filter(|f| f.via.is_some()).count();
+        let mut parts: Vec<(String, usize)> = Vec::new();
+        for f in &result.fanouts {
+            let reference = f.pad.split('.').next().unwrap_or("").to_string();
+            match parts.iter_mut().find(|p| p.0 == reference) {
+                Some(p) => p.1 += 1,
+                None => parts.push((reference, 1)),
+            }
+        }
+        println!(
+            "  fan-out: {} pad{} brought out to where the grid could go on, {} with a via ({})",
+            result.fanouts.len(),
+            if result.fanouts.len() == 1 { "" } else { "s" },
+            vias,
+            parts
+                .iter()
+                .map(|(r, k)| format!("{} of {}", k, r))
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+    }
+    if !result.shut_in.is_empty() {
+        // one line for each reason, with the pads it holds for
+        let mut whys: Vec<(String, Vec<String>)> = Vec::new();
+        for (pad, _, why) in &result.shut_in {
+            match whys.iter_mut().find(|w| w.0 == *why) {
+                Some(w) => w.1.push(pad.clone()),
+                None => whys.push((why.clone(), vec![pad.clone()])),
+            }
+        }
+        for (why, pads) in &whys {
+            let shown = if quiet { 6 } else { pads.len() };
+            println!(
+                "  no fan-out for {} pad{} ({}{}): {}",
+                pads.len(),
+                if pads.len() == 1 { "" } else { "s" },
+                pads[..shown.min(pads.len())].join(", "),
+                if pads.len() > shown { ", ..." } else { "" },
+                why
+            );
+        }
+    }
     if result.doubled > 0 || !result.single.is_empty() {
         println!(
             "  second vias beside the vias of wide tracks: {} added{}",
@@ -582,7 +630,7 @@ fn main() {
         let text = format!(
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
              \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \"blind_vias\": {},\n  \"buried_vias\": {},\n  \
-             \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
+             \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
              \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
             q(&input.display().to_string()),
@@ -596,6 +644,8 @@ fn main() {
             result.vias.len(),
             blind,
             buried,
+            result.fanouts.len(),
+            result.fanouts.iter().filter(|f| f.via.is_some()).count(),
             result.doubled,
             result.single.len(),
             removed,

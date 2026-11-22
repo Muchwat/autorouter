@@ -17,6 +17,9 @@ use crate::tune;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
+mod fanout;
+use fanout::Fan;
+
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Grid pitch in mm.
@@ -62,6 +65,12 @@ pub struct Options {
     /// copper layer, counted from the top (indices into Board::copper). Through
     /// vias are always allowed; empty: through vias only.
     pub via_spans: Vec<(usize, usize)>,
+    /// Bring out the pads the grid cannot reach (the inner balls of a BGA,
+    /// tight fine-pitch pads) with an escape track or a dog-bone via, placed
+    /// exactly.
+    pub fanout: bool,
+    /// How far from its pad a fan-out may end, in mm.
+    pub fanout_length: f64,
     /// Route nets named as differential pairs (`D+`/`D-`, `_P`/`_N`) as pairs.
     pub diff_pairs: bool,
     /// Only these nets as pairs (wildcards; either half's name will do).
@@ -103,6 +112,8 @@ impl Default for Options {
             double_vias: 0.8,
             tracks_on_planes: false,
             via_spans: Vec::new(),
+            fanout: true,
+            fanout_length: 2.0,
             diff_pairs: true,
             only_pairs: None,
             pair_width: None,
@@ -197,7 +208,23 @@ pub struct Routed {
     pub lengths: Vec<LengthReport>,
     /// Things the user should know about the board or the result.
     pub warnings: Vec<String>,
+    /// Pads brought out by a fan-out that the routing went on from.
+    pub fanouts: Vec<FanReport>,
+    /// Pads the grid could not reach and no fan-out fits either: (pad, net, why).
+    pub shut_in: Vec<(String, String, String)>,
     pub log: Vec<String>,
+}
+
+/// A pad the grid could not reach, brought out to where it could.
+#[derive(Clone, Debug)]
+pub struct FanReport {
+    pub net: String,
+    /// The pad, as "U1.B2".
+    pub pad: String,
+    /// Length of its track, from the pad's centre.
+    pub length: f64,
+    /// The layers its via joins, if it ends in one.
+    pub via: Option<(usize, usize)>,
 }
 
 impl Routed {
@@ -759,6 +786,8 @@ struct Router<'a> {
     ngroups: usize,
     /// Inner layers given over to a pour: no tracks there, so the plane stays whole.
     planes: Vec<usize>,
+    /// Fan-outs the board was given before this routing (as kept copper).
+    fans: Vec<Fan>,
     log: Vec<String>,
 }
 
@@ -1140,6 +1169,45 @@ impl<'a> Router<'a> {
         let mut all: Vec<Vec<Entry2>> = Vec::new();
         for t in 0..self.jobs[j].terminals.len() {
             let parts = self.jobs[j].terminals[t].parts.clone();
+            // a pad the fan-out brought to a via: the net goes on from that via, on
+            // another layer (on the pad's own it was shut in)
+            let fan_via = self.fans.iter().find_map(|f| match f.via {
+                Some((at, d, _, span))
+                    if f.net == net
+                        && parts
+                            .iter()
+                            .any(|(s, _, pad)| !*pad && matches!(s, Shape::Circle { c, .. } if *c == at)) =>
+                {
+                    Some((at, d, span, f.layer))
+                }
+                _ => None,
+            });
+            if let Some((at, d, (a, b), pad_layer)) = fan_via {
+                let mut st: Vec<Entry2> = Vec::new();
+                for l in (a..=b).filter(|&l| l != pad_layer) {
+                    if !self.layers_ok(l) {
+                        continue;
+                    }
+                    let near = self.near(j, (at.0, at.1, at.0, at.1), hw + beside);
+                    let mut cells: Vec<usize> = Vec::new();
+                    let bl = &block[l];
+                    self.gr
+                        .each(&Shape::Circle { c: at, r: 0.0 }, (d / 2.0).max(beside), |c| {
+                            if bl[c] == 0 {
+                                cells.push(c);
+                            }
+                        });
+                    for c in cells {
+                        if self.stub_ok(widths[l] / 2.0, self.gr.xy(c), at, l, &near, edge) {
+                            st.push(((l * n + c) as u32, Some((at, widths[l]))));
+                        }
+                    }
+                }
+                st.sort_by(|a, b| a.0.cmp(&b.0));
+                st.dedup_by(|a, b| a.0 == b.0);
+                all.push(st);
+                continue;
+            }
             let loose = loose_ends(&parts);
             let mut st: Vec<Entry2> = Vec::new();
             for &(end, l, _) in &loose {
@@ -2643,7 +2711,140 @@ pub fn wanted(board: &Board, opt: &Options, net: &str) -> bool {
 }
 
 /// Route a board. The board is not changed; the result says what to add.
+/// What a call of route_inner is for.
+enum Stage<'f> {
+    /// Route the board as it is.
+    Plain,
+    /// The board was given the fan-outs `have` as copper. Look for pads that
+    /// (still) need one; if there are any, hand them back in `found` (with
+    /// each pad that has none) and route nothing. Otherwise route.
+    Fan {
+        have: &'f [Fan],
+        found: &'f mut (Vec<Fan>, Vec<(String, String, String)>),
+    },
+    /// Route a board that was given these fan-outs as copper.
+    With(&'f [Fan]),
+}
+
+/// Route the board's unjoined nets.
 pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
+    if !opt.fanout {
+        return route_inner(board, rules, opt, Stage::Plain);
+    }
+    // fan-outs first, as copper the board already has: the router goes on from
+    // their ends. One pad's fan-out can shut in another that had a way out
+    // before, so look again until none is found
+    let mut fans: Vec<Fan> = Vec::new();
+    let mut notes: Vec<(String, String, String)> = Vec::new();
+    let mut with: Option<Board> = None;
+    let mut out = Routed::default();
+    let mut routed = false;
+    for _ in 0..3 {
+        let mut found: (Vec<Fan>, Vec<(String, String, String)>) = (Vec::new(), Vec::new());
+        out = route_inner(
+            with.as_ref().unwrap_or(board),
+            rules,
+            opt,
+            Stage::Fan {
+                have: &fans,
+                found: &mut found,
+            },
+        );
+        notes = found.1;
+        if found.0.is_empty() {
+            routed = true;
+            break;
+        }
+        let b = with.get_or_insert_with(|| board.clone());
+        for f in &found.0 {
+            for &(a, b2, width) in &f.tracks {
+                b.tracks.push(crate::board::Track {
+                    net: Some(f.net.clone()),
+                    layer: f.layer,
+                    a,
+                    b: b2,
+                    width,
+                    locked: false,
+                    span: (0, 0),
+                });
+            }
+            if let Some((at, diameter, drill, layers)) = f.via {
+                b.vias.push(crate::board::Via {
+                    net: Some(f.net.clone()),
+                    at,
+                    diameter,
+                    drill,
+                    layers,
+                    locked: false,
+                    span: (0, 0),
+                });
+            }
+        }
+        fans.extend(found.0);
+    }
+    if !routed {
+        out = route_inner(with.as_ref().unwrap_or(board), rules, opt, Stage::With(&fans));
+    }
+    if !fans.is_empty() {
+        // the ones a new track touches (past the pad itself) are part of the
+        // result; the rest are not written
+        let used: Vec<&Fan> = fans
+            .iter()
+            .filter(|f| {
+                let pad = f.tracks.first().map(|t| t.0).unwrap_or(f.end);
+                out.tracks.iter().filter(|t| t.net == f.net).any(|t| {
+                    [t.a, t.b].iter().any(|&p| {
+                        let on_track = t.layer == f.layer
+                            && geom::dist(p, pad) > 1e-6
+                            && f.tracks
+                                .iter()
+                                .any(|&(a, b, w)| geom::seg_dist(p, a, b) <= w / 2.0 + 1e-6);
+                        let on_via = f
+                            .via
+                            .map(|(at, d, _, (a, b))| {
+                                a <= t.layer
+                                    && t.layer <= b
+                                    && t.layer != f.layer
+                                    && geom::dist(p, at) <= d / 2.0 + 1e-6
+                            })
+                            .unwrap_or(false);
+                        on_track || on_via
+                    })
+                })
+            })
+            .collect();
+        for f in used {
+            for &(a, b, width) in &f.tracks {
+                out.tracks.push(NewTrack {
+                    net: f.net.clone(),
+                    layer: f.layer,
+                    a,
+                    b,
+                    width,
+                });
+            }
+            if let Some((at, diameter, drill, layers)) = f.via {
+                out.vias.push(NewVia {
+                    net: f.net.clone(),
+                    at,
+                    diameter,
+                    drill,
+                    layers,
+                });
+            }
+            out.fanouts.push(FanReport {
+                net: f.net.clone(),
+                pad: f.pad.clone(),
+                length: f.tracks.iter().map(|&(a, b, _)| geom::dist(a, b)).sum(),
+                via: f.via.map(|v| v.3),
+            });
+        }
+    }
+    out.shut_in = notes;
+    out
+}
+
+fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Routed {
     let mut out = Routed::default();
     let nl = board.copper.len();
     let (bx0, by0, bx1, by1) = match board.extent() {
@@ -3222,6 +3423,11 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         radii: HashMap::new(),
         cache_ok,
         log: Vec::new(),
+        fans: match &stage {
+            Stage::With(f) => f.to_vec(),
+            Stage::Fan { have, .. } => have.to_vec(),
+            Stage::Plain => Vec::new(),
+        },
         jobs,
         gr,
     };
@@ -3268,6 +3474,14 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             "  the {} mm grid needs up to {:.3} mm of margin on clearances (asked: {} mm); a finer grid packs tracks closer",
             g, widest, opt.margin
         ));
+    }
+
+    // pads with no way out on the grid: a way out for each, and start again with those
+    if let Stage::Fan { found, .. } = stage {
+        *found = r.fanout();
+        if !found.0.is_empty() {
+            return out;
+        }
     }
 
     let mut pres = 0.5;
@@ -4689,6 +4903,232 @@ mod tests {
             "copper only {:.3} mm apart",
             smallest_gap(&b, &r)
         );
+    }
+
+    /// Rules for fine work: 0.1 mm tracks and gaps, 0.45 mm vias.
+    fn fine_rules() -> Rules {
+        let mut r = rules();
+        r.classes[0].clearance = 0.1;
+        r.classes[0].track_width = 0.1;
+        r.classes[0].via_diameter = 0.45;
+        r.classes[0].via_drill = 0.2;
+        r.hole_to_hole = 0.25;
+        r.hole_clearance = 0.2;
+        r
+    }
+
+    /// A 5 x 5 BGA of 0.4 mm balls at 0.8 mm, a little off the grid, each ball
+    /// wired to a pad of a ring around the board. `extra`: more board.
+    fn bga(extra: &str) -> Board {
+        let mut s = String::from(HEAD);
+        let (mid, pitch) = (10.1, 0.8);
+        s += &format!(
+            "(footprint \"BGA\" (at {} {}) (property \"Reference\" \"U1\")\n",
+            mid, mid
+        );
+        for r in 0..5 {
+            for c in 0..5 {
+                s += &format!(
+                    "(pad \"{}{}\" smd circle (at {} {}) (size 0.4 0.4) (layers \"F.Cu\") (net \"B{}{}\"))\n",
+                    (b'A' + r as u8) as char,
+                    c + 1,
+                    (c as f64 - 2.0) * pitch,
+                    (r as f64 - 2.0) * pitch,
+                    r,
+                    c
+                );
+            }
+        }
+        s += ")\n";
+        // the ring, in the order the balls lie round the middle
+        let mut balls: Vec<(usize, usize)> = (0..5).flat_map(|r| (0..5).map(move |c| (r, c))).collect();
+        balls.sort_by(|a, b| {
+            let angle = |x: &(usize, usize)| (x.0 as f64 - 2.0).atan2(x.1 as f64 - 2.0);
+            angle(a).partial_cmp(&angle(b)).unwrap()
+        });
+        for (k, (r, c)) in balls.iter().enumerate() {
+            let a = -std::f64::consts::PI + 2.0 * std::f64::consts::PI * (k as f64 + 0.5) / 25.0;
+            let t = a.cos().abs().max(a.sin().abs());
+            let (x, y) = (10.0 + 8.5 * a.cos() / t, 10.0 + 8.5 * a.sin() / t);
+            s += &smd(
+                &format!("J{}", k),
+                &format!("B{}{}", r, c),
+                (x * 4.0).round() / 4.0,
+                (y * 4.0).round() / 4.0,
+                0.6,
+                0.6,
+            );
+        }
+        s += extra;
+        s += "(gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\")))";
+        Board::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_inner_balls_of_a_bga_get_dog_bones() {
+        let b = bga("");
+        let rules = fine_rules();
+        // on the grid alone, no via fits between the balls: the nine inner ones are shut in
+        let plain = route(
+            &b,
+            &rules,
+            &Options {
+                fanout: false,
+                ..Options::default()
+            },
+        );
+        assert_eq!(plain.nets.iter().filter(|n| !n.unrouted.is_empty()).count(), 9);
+        let r = route(&b, &rules, &Options::default());
+        assert!(
+            r.complete(),
+            "{:?}",
+            r.nets.iter().filter(|n| !n.unrouted.is_empty()).collect::<Vec<_>>()
+        );
+        assert_eq!(r.fanouts.len(), 9, "{:?}", r.fanouts);
+        assert!(r.shut_in.is_empty());
+        for f in &r.fanouts {
+            assert_eq!(f.via, Some((0, 1)), "{:?}", f);
+            // the via sits in the middle of four balls, on the side away from the part's middle
+            let pad = b.pads.iter().find(|p| p.name() == f.pad).unwrap().shape.centre();
+            let via = r
+                .vias
+                .iter()
+                .filter(|v| v.net == f.net)
+                .min_by(|x, y| geom::dist(x.at, pad).partial_cmp(&geom::dist(y.at, pad)).unwrap())
+                .unwrap();
+            let (dx, dy) = (via.at.0 - pad.0, via.at.1 - pad.1);
+            assert!(
+                (dx.abs() - 0.4).abs() < 0.01 && (dy.abs() - 0.4).abs() < 0.01,
+                "{}: its via is ({:.3}, {:.3}) from the ball",
+                f.pad,
+                dx,
+                dy
+            );
+            let out = (pad.0 - 10.1, pad.1 - 10.1);
+            assert!(dx * out.0 + dy * out.1 >= -1e-9, "{}: its via lies inwards", f.pad);
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.1 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        holes_apart(&r, 0.2 + 0.25);
+        for n in &r.nets {
+            assert!(
+                kicad_joined(&b, &r, &n.net),
+                "{} is not joined as KiCad counts it",
+                n.net
+            );
+        }
+    }
+
+    #[test]
+    fn a_fan_out_nobody_uses_is_not_written() {
+        // the ring pad of the middle ball is walled in by another net: its net cannot be joined
+        let ring = bga("");
+        let far = ring
+            .pads
+            .iter()
+            .find(|p| p.net.as_deref() == Some("B22") && p.reference != "U1")
+            .unwrap()
+            .shape
+            .centre();
+        let mut wall = String::new();
+        for (k, (dx, dy, w, h)) in [
+            (0.0, -0.65, 1.7, 0.4),
+            (0.0, 0.65, 1.7, 0.4),
+            (-0.65, 0.0, 0.4, 0.9),
+            (0.65, 0.0, 0.4, 0.9),
+        ]
+        .iter()
+        .enumerate()
+        {
+            wall += &smd(&format!("W{}", k), "WALL", far.0 + dx, far.1 + dy, *w, *h);
+        }
+        let b = bga(&wall);
+        let r = route(&b, &fine_rules(), &Options::default());
+        let left: Vec<&str> = r
+            .nets
+            .iter()
+            .filter(|n| !n.unrouted.is_empty())
+            .map(|n| n.net.as_str())
+            .collect();
+        assert_eq!(left, vec!["B22"]);
+        assert_eq!(r.fanouts.len(), 8);
+        assert!(
+            r.tracks.iter().all(|t| t.net != "B22"),
+            "a fan-out track of B22 was written"
+        );
+        assert!(
+            r.vias.iter().all(|v| v.net != "B22"),
+            "a fan-out via of B22 was written"
+        );
+    }
+
+    #[test]
+    fn pads_in_a_row_too_tight_for_the_grid_get_landings_of_their_own() {
+        // eight pads 0.2 mm wide at 0.4 mm, with 0.15 mm tracks and gaps: tracks cannot
+        // run that close on a 0.25 mm grid
+        let mut s = String::from(HEAD);
+        s += "(footprint \"ROW\" (at 10.05 6) (property \"Reference\" \"U1\")\n";
+        for k in 0..8 {
+            s += &format!(
+                "(pad \"{}\" smd rect (at {} 0) (size 0.2 0.8) (layers \"F.Cu\") (net \"N{}\"))\n",
+                k + 1,
+                (k as f64 - 3.5) * 0.4,
+                k
+            );
+        }
+        // (the far side of the part: the pads face down the board)
+        s += "(pad \"EP\" smd rect (at 0 -2) (size 3.2 2) (layers \"F.Cu\") (net \"GND\")))\n";
+        for k in 0..8 {
+            s += &smd(
+                &format!("J{}", k),
+                &format!("N{}", k),
+                3.0 + 2.0 * k as f64,
+                17.0,
+                0.8,
+                0.8,
+            );
+        }
+        s += "(gr_rect (start 0 0) (end 20 20) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let mut rules = rules();
+        rules.classes[0].clearance = 0.15;
+        rules.classes[0].track_width = 0.15;
+        rules.classes[0].via_diameter = 0.45;
+        rules.classes[0].via_drill = 0.2;
+        let left = |r: &Routed| r.nets.iter().filter(|n| !n.unrouted.is_empty()).count();
+        let plain = route(
+            &b,
+            &rules,
+            &Options {
+                fanout: false,
+                ..Options::default()
+            },
+        );
+        let r = route(&b, &rules, &Options::default());
+        // (at this pitch the grid cannot bring all eight out, with a landing each or
+        // without: the fan-out gets more of them out)
+        assert!(
+            left(&r) < left(&plain),
+            "{} left, {} without fan-out",
+            left(&r),
+            left(&plain)
+        );
+        assert!(left(&r) <= 1, "{:?} {:?}", r.fanouts, r.shut_in);
+        assert!(!r.fanouts.is_empty());
+        assert!(
+            smallest_gap(&b, &r) >= 0.15 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        for n in r.nets.iter().filter(|n| n.unrouted.is_empty()) {
+            assert!(kicad_joined(&b, &r, &n.net), "{} is not joined", n.net);
+        }
+        // and with ordinary parts nothing is fanned out
+        let plain = route(&crossing(), &self::rules(), &Options::default());
+        assert!(plain.fanouts.is_empty() && plain.shut_in.is_empty());
     }
 
     #[test]
