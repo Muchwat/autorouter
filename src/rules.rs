@@ -115,6 +115,7 @@ pub struct Constraint {
     pub kind: Kind,
     pub min: Option<f64>,
     pub opt: Option<f64>,
+    pub max: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -315,6 +316,7 @@ impl Rules {
                     kind,
                     min: val("min"),
                     opt: val("opt"),
+                    max: val("max"),
                 });
             }
             if constraints.is_empty() {
@@ -524,11 +526,49 @@ impl Rules {
         v.max(self.min_clearance)
     }
 
+    /// The width to route this net at: its class's width, or the `opt` of the
+    /// last track_width rule that applies; never under a rule's `min` (a floor,
+    /// not a target) and, where a `max` applies, not over it.
     pub fn track_width(&self, net: &str) -> f64 {
         let it = Item::track(net);
-        self.constrained(Kind::TrackWidth, &it, &it, false, self.class_of(net).track_width, |c| {
-            c.opt.or(c.min)
-        })
+        let mut width = self.class_of(net).track_width;
+        let (mut floor, mut cap) = (0.0f64, f64::INFINITY);
+        for rule in &self.rules {
+            for c in rule.constraints.iter().filter(|c| c.kind == Kind::TrackWidth) {
+                let how = self.applies(rule, &it, &it, false);
+                if how == T::No {
+                    continue;
+                }
+                if let Some(v) = c.opt {
+                    width = if how == T::Yes { v } else { width.max(v) };
+                }
+                if let Some(v) = c.min {
+                    floor = floor.max(v);
+                }
+                if let (Some(v), T::Yes) = (c.max, how) {
+                    cap = v;
+                }
+            }
+        }
+        width.min(cap).max(floor)
+    }
+
+    /// The smallest copper clearance any rule or class asks for: a lower bound
+    /// on every pair's clearance, which the router sizes its grid margin by.
+    pub fn smallest_clearance(&self) -> f64 {
+        let mut v = self.classes.iter().map(|c| c.clearance).fold(f64::INFINITY, f64::min);
+        for rule in &self.rules {
+            for c in rule.constraints.iter().filter(|c| c.kind == Kind::Clearance) {
+                if let Some(m) = c.min {
+                    v = v.min(m);
+                }
+            }
+        }
+        if v.is_finite() {
+            v.max(self.min_clearance).max(0.0)
+        } else {
+            self.min_clearance.max(0.0)
+        }
     }
 
     /// (diameter, drill) of this net's vias, or None when its rules forbid them.
@@ -895,6 +935,33 @@ mod tests {
         assert_eq!(r.via("+12V"), Some((0.8, 0.4)));
         assert_eq!(r.clearance(&Item::track("+12V"), &Item::track("SDA")), 0.3);
         assert_eq!(r.edge_clearance, 0.3);
+    }
+
+    #[test]
+    fn a_minimum_width_is_a_floor_not_the_width() {
+        let mut r = Rules::default();
+        r.read_project(
+            r#"{"net_settings": {"classes": [{"name": "Default", "clearance": 0.2, "track_width": 0.25},
+                                             {"name": "Power", "clearance": 0.2, "track_width": 1.0}],
+                                 "netclass_assignments": {"VBUS": "Power"}}}"#,
+        )
+        .unwrap();
+        // the fab-house style of rule: no condition, a minimum only
+        r.read_dru("(version 1)\n(rule \"Minimum Trace Width\" (constraint track_width (min 0.127mm)))")
+            .unwrap();
+        assert_eq!(r.track_width("VBUS"), 1.0);
+        assert_eq!(r.track_width("SDA"), 0.25);
+        // a floor above the class width lifts it; an opt sets it; a max caps it
+        r.read_dru("(rule \"a\" (constraint track_width (min 0.4mm)) (condition \"A.NetName == 'SDA'\"))")
+            .unwrap();
+        assert_eq!(r.track_width("SDA"), 0.4);
+        r.read_dru("(rule \"b\" (constraint track_width (min 0.2mm) (opt 0.6mm) (max 0.8mm)) (condition \"A.NetName == 'VBUS'\"))")
+            .unwrap();
+        assert_eq!(r.track_width("VBUS"), 0.6);
+        r.read_dru("(rule \"c\" (constraint track_width (max 0.5mm)) (condition \"A.NetName == 'VBUS'\"))")
+            .unwrap();
+        assert_eq!(r.track_width("VBUS"), 0.5);
+        assert_eq!(r.smallest_clearance(), 0.2);
     }
 
     #[test]

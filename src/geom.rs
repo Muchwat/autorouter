@@ -175,6 +175,43 @@ pub fn arc_points(s: P, m: P, e: P, step: f64) -> Vec<P> {
         .collect()
 }
 
+/// Points along a cubic Bezier curve, about `step` mm apart.
+pub fn bezier_points(p0: P, p1: P, p2: P, p3: P, step: f64) -> Vec<P> {
+    let n = (((dist(p0, p1) + dist(p1, p2) + dist(p2, p3)) / step).ceil() as usize).clamp(2, 2000);
+    (0..=n)
+        .map(|k| {
+            if k == n {
+                return p3; // exactly, so the outline closes
+            }
+            let t = k as f64 / n as f64;
+            let u = 1.0 - t;
+            let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+            (
+                a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
+                a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
+            )
+        })
+        .collect()
+}
+
+/// The smallest distance from the segment a-b to a shape (0 when they touch),
+/// to within a few micrometres.
+pub fn seg_shape_dist(a: P, b: P, shape: &Shape) -> f64 {
+    match *shape {
+        Shape::Circle { c, r } => (seg_dist(c, a, b) - r).max(0.0),
+        Shape::Capsule { a: c, b: d, r } => (seg_seg_dist(a, b, c, d) - r).max(0.0),
+        Shape::Box { .. } => {
+            let n = ((dist(a, b) / 0.01).ceil() as usize).clamp(1, 4000);
+            (0..=n)
+                .map(|k| {
+                    let t = k as f64 / n as f64;
+                    shape.dist((a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)))
+                })
+                .fold(f64::INFINITY, f64::min)
+        }
+    }
+}
+
 /// Even-odd point-in-polygon.
 pub fn in_polygon(p: P, poly: &[P]) -> bool {
     let mut inside = false;

@@ -79,8 +79,11 @@ pub struct Board {
     pub tracks: Vec<Track>,
     pub vias: Vec<Via>,
     pub zones: Vec<Zone>,
-    /// Non-plated holes: (centre, radius).
-    pub holes: Vec<(P, f64)>,
+    /// Non-plated holes and slots, as the shape of what is drilled or milled away.
+    pub holes: Vec<Shape>,
+    /// Byte ranges of the zones' stored fills (`filled_polygon`), which go
+    /// stale the moment a track is added.
+    pub fills: Vec<(usize, usize)>,
     /// The outline (Edge.Cuts), as zero-width segments.
     pub edges: Vec<(P, P)>,
     /// Footprint courtyards, for rules that ask about them: reference -> bbox.
@@ -195,6 +198,7 @@ impl Board {
             vias: Vec::new(),
             zones: Vec::new(),
             holes: Vec::new(),
+            fills: Vec::new(),
             edges: Vec::new(),
             courtyards: BTreeMap::new(),
             end: root.span().map(|s| s.1 - 1).unwrap_or(text.len()),
@@ -349,10 +353,34 @@ impl Board {
         let deg = pad.get("at").and_then(|a| a.num(2)).unwrap_or(0.0);
         let size = pad.get("size").and_then(xy).unwrap_or((1.0, 1.0));
         let drill = pad.get("drill");
-        let drill_d = drill.and_then(|d| d.num(0).or_else(|| d.num(1)));
         if kind == "np_thru_hole" {
-            let r = drill_d.unwrap_or(size.0.min(size.1)) / 2.0;
-            self.holes.push((pos, r));
+            // (drill 3.2) is round; (drill oval 1 3) is a slot, turned with the pad
+            let nums: Vec<f64> = drill
+                .map(|d| d.args().iter().filter_map(|a| a.parse::<f64>().ok()).collect())
+                .unwrap_or_default();
+            let (dw, dh) = match nums.len() {
+                0 => (size.0, size.1),
+                1 => (nums[0], nums[0]),
+                _ => (nums[0], nums[1]),
+            };
+            let half = rot(
+                if dw >= dh {
+                    ((dw - dh) / 2.0, 0.0)
+                } else {
+                    (0.0, (dh - dw) / 2.0)
+                },
+                deg,
+            );
+            let r = dw.min(dh) / 2.0;
+            self.holes.push(if (dw - dh).abs() < 1e-9 {
+                Shape::Circle { c: pos, r }
+            } else {
+                Shape::Capsule {
+                    a: (pos.0 - half.0, pos.1 - half.1),
+                    b: (pos.0 + half.0, pos.1 + half.1),
+                    r,
+                }
+            });
             return;
         }
         let offset = drill.and_then(|d| d.get("offset")).and_then(xy).unwrap_or((0.0, 0.0));
@@ -461,6 +489,11 @@ impl Board {
     }
 
     fn zone(&mut self, z: &Node, net_of: &dyn Fn(&Node) -> Option<String>, layer_list: &dyn Fn(&Node) -> Vec<usize>) {
+        for fill in z.all("filled_polygon").chain(z.all("fill_segments")) {
+            if let Some(span) = fill.span() {
+                self.fills.push(span);
+            }
+        }
         let layers = layer_list(z);
         let outline: Vec<P> = z
             .get("polygon")
@@ -526,6 +559,18 @@ impl Board {
                     let c = [a, (b.0, a.1), b, (a.0, b.1)].map(&place);
                     for k in 0..4 {
                         self.edges.push((c[k], c[(k + 1) % 4]));
+                    }
+                }
+            }
+            "curve" => {
+                // a cubic Bezier: (pts (xy start) (xy control) (xy control) (xy end))
+                if let Some(pts) = item.get("pts") {
+                    let p: Vec<P> = pts.all("xy").filter_map(xy).map(&place).collect();
+                    if p.len() == 4 {
+                        let pts = geom::bezier_points(p[0], p[1], p[2], p[3], 0.1);
+                        for w in pts.windows(2) {
+                            self.edges.push((w[0], w[1]));
+                        }
                     }
                 }
             }
@@ -610,6 +655,40 @@ mod tests {
         assert_eq!(b.poured_nets(), vec!["A".to_string()]);
         assert_eq!(b.edges.len(), 4);
         assert_eq!(b.extent(), Some((0.0, 0.0, 20.0, 20.0)));
+    }
+
+    #[test]
+    fn slots_curves_and_fills() {
+        let t = r#"(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+          (footprint "J" (at 10 10 90) (property "Reference" "J1")
+            (pad "" np_thru_hole oval (at 0 0 90) (size 1 3) (drill oval 1 3) (layers "*.Cu" "*.Mask"))
+            (pad "" np_thru_hole circle (at 5 0 90) (size 2 2) (drill 2) (layers "*.Cu" "*.Mask")))
+          (zone (net "GND") (layer "F.Cu") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20)))
+            (filled_polygon (layer "F.Cu") (pts (xy 0 0) (xy 20 0) (xy 20 20))))
+          (gr_curve (pts (xy 0 0) (xy 0 10) (xy 10 20) (xy 20 20)) (layer "Edge.Cuts")))"#;
+        let b = Board::parse(t.to_string()).unwrap();
+        // the slot is 3 mm long in the pad's frame, which is turned 90 degrees: it runs along x
+        match b.holes[0] {
+            Shape::Capsule { a, b, r } => {
+                assert!((r - 0.5).abs() < 1e-9);
+                assert!(
+                    (a.1 - 10.0).abs() < 1e-9 && (b.1 - 10.0).abs() < 1e-9,
+                    "{:?} {:?}",
+                    a,
+                    b
+                );
+                assert!(((a.0 - b.0).abs() - 2.0).abs() < 1e-9);
+            }
+            other => panic!("the slot came out as {:?}", other),
+        }
+        assert_eq!(b.holes[1], Shape::Circle { c: (10.0, 5.0), r: 1.0 });
+        assert_eq!(b.fills.len(), 1);
+        assert!(b.text[b.fills[0].0..b.fills[0].1].starts_with("(filled_polygon"));
+        // the curve is a chain of short segments from its first point to its last
+        assert!(b.edges.len() > 20);
+        assert_eq!(b.edges[0].0, (0.0, 0.0));
+        let last = b.edges[b.edges.len() - 1].1;
+        assert!((last.0 - 20.0).abs() < 1e-9 && (last.1 - 20.0).abs() < 1e-9);
     }
 
     #[test]

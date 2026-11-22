@@ -19,13 +19,18 @@ usage: autorouter BOARD.kicad_pcb [options]
                          (locked ones stay)
       --layers F.Cu,B.Cu copper layers to use (default: all)
       --grid MM          grid pitch (default 0.25; 0.254 suits 0.1 inch through-hole parts)
-      --margin MM        extra gap on every clearance for the grid's corners (default 0.05)
+      --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
+                         raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
       --via D/DRILL      one via size for every net, e.g. 0.6/0.3 (default: from the rules)
       --no-vias          route without vias
+      --via-in-pad       let vias sit on surface-mount pads of their own net
       --via-cost N       what a via costs, in grid steps (default 12)
       --passes N         most negotiation passes (default 40)
-      --drc              check the result with KiCad's DRC (kicad-cli), custom rules included
+      --drc              refill the zones and check the result with KiCad's DRC (kicad-cli),
+                         custom rules included; the refilled board is what gets written
+      --keep-fills       leave the zones' old fills in the output (they are removed by
+                         default, being stale once tracks change; --drc pours them again)
   -q, --quiet            only the summary
   -h, --help             this text
 
@@ -73,15 +78,36 @@ fn kicad_cli() -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// KiCad's DRC on `pcb`, with the rules from beside `rules_from`. (errors, unconnected, report)
-fn drc(pcb: &Path, rules_from: &Path) -> Result<(usize, usize, String), String> {
+/// "** Found N DRC violations **" -> N
+fn found(report: &str, what: &str) -> Option<usize> {
+    report
+        .lines()
+        .find(|l| l.starts_with("** Found") && l.contains(what))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .and_then(|n| n.parse().ok())
+}
+
+struct Drc {
+    errors: usize,
+    unconnected: usize,
+    /// The board as KiCad saved it after pouring the zones again, when it could.
+    refilled: Option<String>,
+}
+
+/// KiCad's DRC on `pcb`, zones poured again first, with the rules from beside `rules_from`.
+fn drc(pcb: &Path, rules_from: &Path) -> Result<Drc, String> {
     let cli = kicad_cli().ok_or("kicad-cli not found (set KICAD_CLI to its path)")?;
     // in a folder of its own, named like the original so its .kicad_pro and .kicad_dru apply
     let dir = std::env::temp_dir().join(format!("autorouter-drc-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let result = drc_in(&cli, &dir, pcb, rules_from);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn drc_in(cli: &Path, dir: &Path, pcb: &Path, rules_from: &Path) -> Result<Drc, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let stem = rules_from.file_stem().and_then(|s| s.to_str()).unwrap_or("board");
     let board = dir.join(format!("{}.kicad_pcb", stem));
-    std::fs::copy(pcb, &board).map_err(|e| e.to_string())?;
     for ext in ["kicad_pro", "kicad_dru"] {
         let src = rules_from.with_extension(ext);
         if src.exists() {
@@ -89,31 +115,46 @@ fn drc(pcb: &Path, rules_from: &Path) -> Result<(usize, usize, String), String> 
         }
     }
     let report = dir.join("drc.rpt");
-    let out = Command::new(&cli)
-        .args([
-            "pcb",
-            "drc",
-            "--severity-error",
-            "--units",
-            "mm",
-            "--refill-zones",
-            "-o",
-        ])
-        .arg(&report)
-        .arg(&board)
-        .output()
-        .map_err(|e| format!("could not run {}: {}", cli.display(), e))?;
-    let text = std::fs::read_to_string(&report)
-        .map_err(|_| format!("kicad-cli wrote no report: {}", String::from_utf8_lossy(&out.stderr)))?;
-    let _ = std::fs::remove_dir_all(&dir);
-    let count = |what: &str| -> usize {
-        text.lines()
-            .find(|l| l.starts_with("** Found") && l.contains(what))
-            .and_then(|l| l.split_whitespace().nth(2))
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(0)
-    };
-    Ok((count("DRC violations"), count("unconnected"), text))
+    // newest first: pour and save; then pour only; then as the board is (older kicad-cli)
+    let tries: [&[&str]; 3] = [&["--refill-zones", "--save-board"], &["--refill-zones"], &[]];
+    let mut last = String::new();
+    for extra in tries {
+        std::fs::copy(pcb, &board).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&report);
+        let out = Command::new(cli)
+            .args(["pcb", "drc", "--severity-error", "--units", "mm"])
+            .args(extra)
+            .arg("-o")
+            .arg(&report)
+            .arg(&board)
+            .output()
+            .map_err(|e| format!("could not run {}: {}", cli.display(), e))?;
+        let text = match std::fs::read_to_string(&report) {
+            Ok(t) => t,
+            Err(_) => {
+                last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                continue;
+            }
+        };
+        // no count line is no answer: never read it as "none found"
+        let (errors, unconnected) = match (found(&text, "DRC violations"), found(&text, "unconnected")) {
+            (Some(e), Some(u)) => (e, u),
+            _ => return Err("could not read the counts in kicad-cli's report".into()),
+        };
+        let refilled = if extra.contains(&"--save-board") {
+            std::fs::read_to_string(&board)
+                .ok()
+                .filter(|t| t.starts_with("(kicad_pcb"))
+        } else {
+            None
+        };
+        return Ok(Drc {
+            errors,
+            unconnected,
+            refilled,
+        });
+    }
+    Err(format!("kicad-cli wrote no report: {}", last))
 }
 
 fn main() {
@@ -126,8 +167,8 @@ fn main() {
         progress: true,
         ..Options::default()
     };
-    let (mut input, mut output, mut rip, mut check, mut quiet) =
-        (None::<PathBuf>, None::<PathBuf>, false, false, false);
+    let (mut input, mut output, mut rip, mut check, mut quiet, mut keep_fills) =
+        (None::<PathBuf>, None::<PathBuf>, false, false, false, false);
     let mut layer_names: Option<Vec<String>> = None;
     let mut i = 0;
     let value = |i: &mut usize, name: &str| -> String {
@@ -148,8 +189,10 @@ fn main() {
             "--grid" => opt.grid = mm(&value(&mut i, &a), &a),
             "--margin" => {
                 opt.margin = value(&mut i, &a)
-                    .parse()
-                    .unwrap_or_else(|_| die("--margin needs a number"))
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|m| *m >= 0.0)
+                    .unwrap_or_else(|| die("--margin needs a number of millimetres, 0 or more"))
             }
             "--width" | "--track-width" => opt.track_width = Some(mm(&value(&mut i, &a), &a)),
             "--via" => {
@@ -160,7 +203,15 @@ fn main() {
                 opt.via = Some((mm(d, "--via"), mm(h, "--via")));
             }
             "--no-vias" => opt.no_vias = true,
-            "--via-cost" => opt.via_cost = mm(&value(&mut i, &a), &a),
+            "--via-in-pad" => opt.via_in_pad = true,
+            "--keep-fills" => keep_fills = true,
+            "--via-cost" => {
+                opt.via_cost = value(&mut i, &a)
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|c| *c > 0.0)
+                    .unwrap_or_else(|| die("--via-cost needs a number above 0"))
+            }
             "--passes" => {
                 opt.passes = value(&mut i, &a)
                     .parse()
@@ -241,8 +292,14 @@ fn main() {
         let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("board");
         input.with_file_name(format!("{}-routed.kicad_pcb", stem))
     });
-    let text = write::with_routes(&board, &result, &[]);
+    // the zones' stored fills are stale once copper changes: out they go, to be poured again
+    let changed = removed > 0 || !result.tracks.is_empty() || !result.vias.is_empty();
+    let stale: &[(usize, usize)] = if changed && !keep_fills { &board.fills } else { &[] };
+    let text = write::with_routes(&board, &result, stale);
     std::fs::write(&output, text).unwrap_or_else(|e| die(&format!("cannot write {}: {}", output.display(), e)));
+    for w in &result.warnings {
+        eprintln!("warning: {}", w);
+    }
 
     let left: Vec<&router::NetReport> = result.nets.iter().filter(|n| !n.unrouted.is_empty()).collect();
     if !quiet {
@@ -277,9 +334,21 @@ fn main() {
     let mut status = if left.is_empty() { 0 } else { 1 };
     if check {
         match drc(&output, &input) {
-            Ok((errors, unconnected, _)) => {
-                println!("KiCad DRC: {} errors, {} unconnected", errors, unconnected);
-                if errors > 0 || unconnected > 0 {
+            Ok(d) => {
+                let poured = match d.refilled {
+                    Some(text) if !keep_fills => std::fs::write(&output, text).is_ok(),
+                    _ => false,
+                };
+                println!(
+                    "KiCad DRC: {} errors, {} unconnected{}",
+                    d.errors,
+                    d.unconnected,
+                    if poured { " (zones poured again and saved)" } else { "" }
+                );
+                if !poured && !stale.is_empty() {
+                    println!("  zone fills were removed from the output: pour them again in KiCad (B)");
+                }
+                if d.errors > 0 || d.unconnected > 0 {
                     status = 1;
                 }
             }
@@ -288,6 +357,13 @@ fn main() {
                 status = 1;
             }
         }
+    } else if !stale.is_empty() {
+        println!(
+            "  {} zone fill(s) removed, as the new copper made them stale: pour them again in KiCad (B), or use --drc",
+            stale.len()
+        );
+    } else if changed && keep_fills && !board.fills.is_empty() {
+        println!("  the zones' old fills were kept: they overlap the new copper until poured again in KiCad (B)");
     }
     exit(status);
 }

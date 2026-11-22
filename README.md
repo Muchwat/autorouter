@@ -14,8 +14,10 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **Every net at once.** Nets are routed together and bargain for space (negotiated congestion, the PathFinder scheme of McMurchie and Ebeling, 1995). A spot two nets both want gets dearer each pass, and only the nets still in conflict are routed again. So the order nets come in does not decide whether a board finishes.
 - **Always legal.** If the passes run out with nets still in conflict, those nets are routed once more with everyone else's copper as walls. A net may be left unjoined, but tracks never overlap or break a clearance the router knows about.
 - **KiCad's rules, per net pair.** Clearance between two items is worked out the way KiCad's DRC does it: the larger net-class clearance, overridden by the last custom rule that matches, never below the board minimum.
-- **Existing copper is kept.** Pads, tracks and vias of other nets are obstacles. A net's own copper already joins what it touches, so only the missing links are routed. Locked items stay even with `--rip`.
-- **The real board shape.** The outline (lines, arcs, circles, rectangles, polygons, and edge cuts inside footprints) and keep-out areas are walls, so slots and odd shapes work.
+- **Existing copper is kept.** Pads, tracks and vias of other nets are obstacles. A net's own copper already joins what it reaches, counted the way KiCad counts it (a track's end, or a via's or pad's centre, on the other item), so only the missing links are routed. Locked items stay even with `--rip`.
+- **Tracks finish on the pad's centre.** The last piece of track into a pad is checked against every clearance exactly, not on the grid, and a pad too small for a grid point is entered from just beside it.
+- **Vias stay off pads.** No via is put on a surface-mount pad of its own net (the open hole drains the solder joint) unless you pass `--via-in-pad`, and none in a through-hole pad or on another via.
+- **The real board shape.** The outline (lines, arcs, circles, rectangles, polygons, Bezier curves, and edge cuts inside footprints), non-plated holes and milled slots, and keep-out areas are walls. An outline that is not closed is reported, and the board is routed without it.
 - **Any number of copper layers,** with through vias. Every track starts and ends on its pad's centre.
 - **KiCad 7 to 10 files,** both the numbered nets of KiCad 7 to 9 and the named nets of KiCad 10. Only new items are added and replaced ones cut out; the rest of the file stays byte for byte as KiCad wrote it.
 
@@ -25,7 +27,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 |---|---|
 | `.kicad_pro` net classes | clearance, track width, via diameter and drill; assignments and wildcard patterns |
 | `.kicad_pro` board rules | minimum clearance, copper-to-edge clearance |
-| `.kicad_dru` constraints | `clearance`, `track_width` (opt, else min), `edge_clearance`, `disallow via` |
+| `.kicad_dru` constraints | `clearance`, `track_width` (`opt` sets the width, `min` is a floor, `max` a cap), `edge_clearance`, `disallow via` |
 | `.kicad_dru` conditions | `A/B.NetName`, `A/B.NetClass`, `A/B.Type`, `==` and `!=` with wildcards, `&&`, `\|\|`, `!`, `hasNetclass()`, `intersectsCourtyard()` and `insideCourtyard()` for pads |
 
 Conditions are evaluated with three values: true, false and "can't tell". Some tests can't be answered while routing, such as whether a track will cross a courtyard, or any function the router does not know. A rule whose condition might hold is applied, so the router errs on the safe side, and it prints a note naming the rule. Layer-limited rules are applied on every layer.
@@ -42,19 +44,28 @@ autorouter BOARD.kicad_pcb [options]
       --rip              remove the existing tracks and vias of the nets being routed first
       --layers F.Cu,B.Cu copper layers to use (default: all)
       --grid MM          grid pitch (default 0.25; 0.254 suits 0.1 inch through-hole parts)
-      --margin MM        extra gap on every clearance for the grid's corners (default 0.05)
+      --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
+                         raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
       --via D/DRILL      one via size for every net, e.g. 0.6/0.3 (default: from the rules)
       --no-vias          route without vias
+      --via-in-pad       let vias sit on surface-mount pads of their own net
       --via-cost N       what a via costs, in grid steps (default 12)
       --passes N         most negotiation passes (default 40)
-      --drc              check the result with KiCad's DRC (kicad-cli), custom rules included
+      --drc              refill the zones and check the result with KiCad's DRC (kicad-cli),
+                         custom rules included; the refilled board is what gets written
+      --keep-fills       leave the zones' old fills in the output (they are removed by
+                         default, being stale once tracks change; --drc pours them again)
   -q, --quiet            only the summary
 ```
 
 The exit status is 0 when every net is joined (and, with `--drc`, KiCad finds no errors), 1 when something is left, and 2 on bad input. `--drc` looks for `kicad-cli` in `KICAD_CLI`, the usual install places and `PATH`, and checks a copy of the output beside the board's own `.kicad_pro` and `.kicad_dru`.
 
+**Copper pours.** A zone's stored fill is only right for the copper that was there when it was poured, so once tracks change, the old fill would lie across the new tracks. The output therefore has the fills taken out: pour them again in KiCad (press B) before you plot. With `--drc`, KiCad pours the zones, checks the board and saves it, so the file you get is the file that was checked. `--keep-fills` leaves the old fills in.
+
 Nets with a copper pour (GND, usually) are left to the pour unless you pass `--include-poured`. New tracks can cut a pour into islands. With `--drc`, KiCad reports any island that nothing joins; add stitching vias, or route the poured net too.
+
+**Grid.** Walls and conflicts are tested at grid points, so a track between two points can pass a little nearer to other copper than the points do. Every clearance carries a margin for that, worked out from the grid: 0.05 mm at the default 0.25 mm, more on a coarser grid (about 0.45 mm at 1 mm). A coarse grid is safe but packs tracks loosely.
 
 ### As a library
 
@@ -76,8 +87,8 @@ These are measured on two real boards, checked by KiCad 10's own DRC with each b
 | Board | Job | Result | Time |
 |---|---|---|---|
 | A reflow-hotplate controller, 110 x 88 mm, 2 layers, 240 V mains | all 27 low-voltage nets, hand-routed mains kept | 27 of 27 joined, 0 errors, 0 unconnected | 3 s |
-| The same board | the whole board from nothing, mains included (8 mm mains to low voltage, 2.5 mm between mains nets, 2 mm heater tracks, no vias on mains) | 34 of 34 joined, 0 errors, 0 unconnected | 4 to 6 s |
-| A dispenser controller, 176 x 69 mm, 2 layers, 164 parts, fine-pitch ESP32-S3 and USB-C | all 101 nets including ground | 101 of 101 joined, 0 errors, 0 unconnected | 15 s |
+| The same board | the whole board from nothing, mains included (8 mm mains to low voltage, 2.5 mm between mains nets, 2 mm heater tracks, no vias on mains) | 34 of 34 joined, 0 errors, 0 unconnected | 6 s |
+| A dispenser controller, 176 x 69 mm, 2 layers, 164 parts, fine-pitch ESP32-S3 and USB-C | all 101 nets including ground (locked fan-out tracks kept) | 101 of 101 joined, 0 errors, 0 unconnected | 8 s |
 
 The mains board is the case per-pair rules are for. A net class has one clearance, and it can't be 8 mm to low voltage and 2.5 mm to the other mains nets at the same time.
 
@@ -87,6 +98,7 @@ The mains board is the case per-pair rules are for. A net class has one clearanc
 - **Pad shapes.** Custom pad shapes are taken as their bounding box, and trapezoids as their enclosing rectangle. That is safe but can block more than it needs to.
 - **Through vias only.** No blind or buried vias, and no micro vias.
 - **Rules on the safe side.** A condition the router can't settle makes the rule apply everywhere. A rule that exempts an area, like a courtyard, is honoured for the pads in that area but not for tracks near them.
+- **Fine-pitch parts.** A pad whose neighbours leave no legal way in on the grid is left unjoined and reported, not forced. Fan such pads out by hand, lock those tracks, and the router carries on from them.
 - **Check the result.** Run KiCad's DRC (or `--drc`) before you order a board. The router's own checks are on its grid; KiCad has the final word.
 
 ## How it works
