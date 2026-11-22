@@ -25,6 +25,30 @@ pub struct NetClass {
     pub track_width: f64,
     pub via_diameter: f64,
     pub via_drill: f64,
+    /// Differential pairs: track width, gap between the two tracks, and gap
+    /// between their two vias (0 where the class does not say).
+    pub pair_width: f64,
+    pub pair_gap: f64,
+    pub pair_via_gap: f64,
+}
+
+/// A net named as one half of a differential pair, the way KiCad reads names:
+/// `USB_D+` / `USB_D-`, or `CLK_P` / `CLK_N`. Returns the other half's name
+/// and whether this one is the positive half.
+pub fn pair_partner(net: &str) -> Option<(String, bool)> {
+    for (mine, theirs, positive) in [
+        ("+", "-", true),
+        ("-", "+", false),
+        ("_P", "_N", true),
+        ("_N", "_P", false),
+    ] {
+        if let Some(base) = net.strip_suffix(mine) {
+            if !base.is_empty() {
+                return Some((format!("{}{}", base, theirs), positive));
+            }
+        }
+    }
+    None
 }
 
 /// What a rule can know about one of the two items it compares.
@@ -151,6 +175,9 @@ impl Default for Rules {
                 track_width: 0.25,
                 via_diameter: 0.6,
                 via_drill: 0.3,
+                pair_width: 0.0,
+                pair_gap: 0.0,
+                pair_via_gap: 0.0,
             }],
             assignments: BTreeMap::new(),
             patterns: Vec::new(),
@@ -260,6 +287,9 @@ impl Rules {
                         track_width: f("track_width", builtin.track_width),
                         via_diameter: f("via_diameter", builtin.via_diameter),
                         via_drill: f("via_drill", builtin.via_drill),
+                        pair_width: f("diff_pair_width", 0.0),
+                        pair_gap: f("diff_pair_gap", 0.0),
+                        pair_via_gap: f("diff_pair_via_gap", 0.0),
                     }
                 }
                 None => builtin,
@@ -273,6 +303,9 @@ impl Rules {
                     track_width: f("track_width", d.track_width),
                     via_diameter: f("via_diameter", d.via_diameter),
                     via_drill: f("via_drill", d.via_drill),
+                    pair_width: f("diff_pair_width", d.pair_width),
+                    pair_gap: f("diff_pair_gap", d.pair_gap),
+                    pair_via_gap: f("diff_pair_via_gap", d.pair_via_gap),
                     name,
                 });
             }
@@ -1062,6 +1095,23 @@ mod tests {
             .unwrap();
         assert_eq!(r.track_width("VBUS"), 0.5);
         assert_eq!(r.smallest_clearance(), 0.2);
+    }
+
+    #[test]
+    fn pair_names_and_settings() {
+        assert_eq!(pair_partner("/USB_D+"), Some(("/USB_D-".to_string(), true)));
+        assert_eq!(pair_partner("/USB_D-"), Some(("/USB_D+".to_string(), false)));
+        assert_eq!(pair_partner("CLK_N"), Some(("CLK_P".to_string(), false)));
+        assert_eq!(pair_partner("RESET"), None);
+        assert_eq!(pair_partner("+"), None);
+        let mut r = Rules::default();
+        r.read_project(
+            r#"{"net_settings": {"classes": [{"name": "Default", "clearance": 0.2, "track_width": 0.25,
+                 "diff_pair_width": 0.2, "diff_pair_gap": 0.18, "diff_pair_via_gap": 0.25}]}}"#,
+        )
+        .unwrap();
+        let c = r.class_of("/USB_D+");
+        assert_eq!((c.pair_width, c.pair_gap, c.pair_via_gap), (0.2, 0.18, 0.25));
     }
 
     #[test]

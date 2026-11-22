@@ -18,6 +18,7 @@
 pub mod board;
 pub mod geom;
 pub mod json;
+pub mod pair;
 pub mod pour;
 pub mod router;
 pub mod rules;

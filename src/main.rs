@@ -31,6 +31,11 @@ usage: autorouter BOARD.kicad_pcb [options]
       --neck MM          width a track narrows to where it is too wide to reach a pad
                          (default: the Default class's width, or the rules' minimum if more)
       --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
+      --no-diff-pairs    route nets named as pairs (D+/D-, _P/_N) one by one, not as pairs
+      --diff-pairs A,B   only these nets as pairs (wildcards; either half's name)
+      --pair W/GAP       width of a pair's tracks and the gap between them, e.g. 0.2/0.15
+                         (default: the net class's pair settings, else its track width
+                         and the clearance between the two nets)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
@@ -215,6 +220,16 @@ fn main() {
             "--no-vias" => opt.no_vias = true,
             "--tracks-on-planes" => opt.tracks_on_planes = true,
             "--via-in-pad" => opt.via_in_pad = true,
+            "--no-diff-pairs" => opt.diff_pairs = false,
+            "--diff-pairs" => opt.only_pairs = Some(list(&value(&mut i, &a))),
+            "--pair" => {
+                let v = value(&mut i, &a);
+                let (w, gap) = v
+                    .split_once('/')
+                    .unwrap_or_else(|| die("--pair takes WIDTH/GAP, e.g. 0.2/0.15"));
+                opt.pair_width = Some(mm(w, "--pair"));
+                opt.pair_gap = Some(mm(gap, "--pair"));
+            }
             "--neck" => opt.neck = Some(mm(&value(&mut i, &a), &a)),
             "--report" => report = Some(PathBuf::from(value(&mut i, &a))),
             "--double-vias" => {
@@ -370,6 +385,34 @@ fn main() {
     if !necked.is_empty() {
         println!("  narrowed to reach {} pad(s): {}", necked.len(), necked.join("; "));
     }
+    for p in &result.pairs {
+        if p.as_pair {
+            println!(
+                "  pair {} / {}: {:.1} mm side by side ({} of {} stretch{}) at {} mm with a {} mm gap; lengths {:.1} and {:.1} mm ({:.2} mm apart){}",
+                p.positive,
+                p.negative,
+                p.coupled,
+                p.coupled_legs,
+                p.legs,
+                if p.legs == 1 { "" } else { "es" },
+                p.width,
+                p.gap,
+                p.length_positive,
+                p.length_negative,
+                (p.length_positive - p.length_negative).abs(),
+                if p.note.is_empty() {
+                    String::new()
+                } else {
+                    format!("; one by one elsewhere: {}", p.note)
+                }
+            );
+        } else {
+            println!(
+                "  {} / {} routed one by one, not as a pair: {}",
+                p.positive, p.negative, p.note
+            );
+        }
+    }
     if result.doubled > 0 || !result.single.is_empty() {
         println!(
             "  second vias beside the vias of wide tracks: {} added{}",
@@ -456,7 +499,7 @@ fn main() {
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
              \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \
              \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
-             \"narrowed\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
+             \"narrowed\": {},\n  \"pairs\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
             q(&input.display().to_string()),
             q(&output.display().to_string()),
@@ -488,6 +531,25 @@ fn main() {
                     q(pad),
                     w
                 )))
+                .collect()),
+            list(result
+                .pairs
+                .iter()
+                .map(|p| format!(
+                    "{{\"positive\": {}, \"negative\": {}, \"as_pair\": {}, \"stretches\": {}, \"side_by_side\": {}, \"note\": {}, \"width\": {}, \"gap\": {}, \
+                     \"coupled_mm\": {:.2}, \"length_positive_mm\": {:.2}, \"length_negative_mm\": {:.2}}}",
+                    q(&p.positive),
+                    q(&p.negative),
+                    p.as_pair,
+                    p.legs,
+                    p.coupled_legs,
+                    q(&p.note),
+                    p.width,
+                    p.gap,
+                    p.coupled,
+                    p.length_positive,
+                    p.length_negative
+                ))
                 .collect()),
             list(cuts
                 .iter()

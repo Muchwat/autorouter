@@ -11,6 +11,7 @@
 
 use crate::board::Board;
 use crate::geom::{self, Shape, P};
+use crate::pair;
 use crate::rules::{Item, Rules};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
@@ -56,6 +57,14 @@ pub struct Options {
     /// Also lay tracks on inner layers that a pour covers (by default such a
     /// layer is a plane, and stays whole).
     pub tracks_on_planes: bool,
+    /// Route nets named as differential pairs (`D+`/`D-`, `_P`/`_N`) as pairs.
+    pub diff_pairs: bool,
+    /// Only these nets as pairs (wildcards; either half's name will do).
+    pub only_pairs: Option<Vec<String>>,
+    /// Width of a pair's tracks and the gap between them (None: the net class's
+    /// pair settings, else its track width and the clearance between the two nets).
+    pub pair_width: Option<f64>,
+    pub pair_gap: Option<f64>,
     /// Print progress to stderr.
     pub progress: bool,
 }
@@ -81,6 +90,10 @@ impl Default for Options {
             neck_length: 3.0,
             double_vias: 0.8,
             tracks_on_planes: false,
+            diff_pairs: true,
+            only_pairs: None,
+            pair_width: None,
+            pair_gap: None,
             progress: false,
         }
     }
@@ -115,6 +128,26 @@ pub struct NetReport {
     pub unrouted: Vec<String>,
 }
 
+/// How a differential pair came out.
+#[derive(Clone, Debug)]
+pub struct PairReport {
+    pub positive: String,
+    pub negative: String,
+    /// False when no part of the two nets was routed side by side; `note` says why.
+    pub as_pair: bool,
+    pub note: String,
+    /// The stretches between the pair's ends, and how many were routed side by
+    /// side (the others, one net at a time).
+    pub legs: usize,
+    pub coupled_legs: usize,
+    pub width: f64,
+    pub gap: f64,
+    /// Length routed side by side, and each track's whole length, in mm.
+    pub coupled: f64,
+    pub length_positive: f64,
+    pub length_negative: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Routed {
     pub tracks: Vec<NewTrack>,
@@ -127,6 +160,8 @@ pub struct Routed {
     pub doubled: usize,
     /// Vias of wide tracks with no room for a second one: (net, where).
     pub single: Vec<(String, P)>,
+    /// Differential pairs, routed as such or not.
+    pub pairs: Vec<PairReport>,
     /// Things the user should know about the board or the result.
     pub warnings: Vec<String>,
     pub log: Vec<String>,
@@ -205,6 +240,7 @@ struct Obstacle {
     group: usize,
 }
 
+#[derive(Clone)]
 struct Terminal {
     label: String,
     centre: P,
@@ -224,6 +260,138 @@ struct Job {
     terminals: Vec<Terminal>,
     sig: usize,
     span: f64,
+    /// Some: this job routes two nets as a differential pair (`net` is the positive one).
+    pair: Option<PairSpec>,
+}
+
+/// One end of a differential pair: where its two tracks finish.
+#[derive(Clone)]
+struct PairEnd {
+    label: String,
+    p: P,
+    n: P,
+    layers: Vec<usize>,
+    /// Which piece of the positive net's job, and of the negative's, this end is.
+    piece_p: usize,
+    piece_n: usize,
+}
+
+#[derive(Clone)]
+struct PairSpec {
+    /// The jobs that route the two nets one by one, should the pair not work out.
+    job_p: usize,
+    job_n: usize,
+    net_n: String,
+    /// Width of each track and the gap between them.
+    w: f64,
+    gap: f64,
+    /// One via of the two (diameter, drill), their least pitch, and how far to
+    /// its side of the path each must stand for the other track to pass it.
+    via: Option<(f64, f64)>,
+    via_pitch: f64,
+    via_side: f64,
+    /// The least copper gap the two nets owe each other anywhere.
+    pn: f64,
+    /// The ends, in the order they are joined.
+    ends: Vec<PairEnd>,
+}
+
+/// Loose ends of a piece's tracks: (point, layer, track width). A track end is
+/// loose when no other copper of the piece holds it.
+fn loose_ends(parts: &[(Shape, Vec<usize>, bool)]) -> Vec<(P, usize, f64)> {
+    let mut loose = Vec::new();
+    for (i, (shape, layers, is_pad)) in parts.iter().enumerate() {
+        if let (Shape::Capsule { a, b, r }, false) = (shape, *is_pad) {
+            for end in [*a, *b] {
+                let held = parts.iter().enumerate().any(|(k, (other, ol, _))| {
+                    k != i && layers.iter().any(|l| ol.contains(l)) && other.dist(end) <= 1e-6
+                });
+                if !held {
+                    loose.push((end, layers[0], 2.0 * r));
+                }
+            }
+        }
+    }
+    loose
+}
+
+/// Work out how two nets pair up: which piece of one goes with which of the
+/// other, and in what order to join the ends.
+fn pair_ends(p: &Job, n: &Job) -> Result<Vec<PairEnd>, String> {
+    let attach = |t: &Terminal| -> (P, Vec<usize>) {
+        match loose_ends(&t.parts).first() {
+            Some(&(end, l, _)) => (end, vec![l]),
+            None => {
+                let layers = t.parts.iter().find(|x| x.2).map(|x| x.1.clone()).unwrap_or_default();
+                (t.centre, layers)
+            }
+        }
+    };
+    if p.terminals.len() != n.terminals.len() {
+        return Err(format!(
+            "one net has {} pieces to join and the other {}",
+            p.terminals.len(),
+            n.terminals.len()
+        ));
+    }
+    let mut used = vec![false; n.terminals.len()];
+    let mut ends: Vec<PairEnd> = Vec::new();
+    for (piece_p, t) in p.terminals.iter().enumerate() {
+        let (pp, pl) = attach(t);
+        let best = (0..n.terminals.len())
+            .filter(|&k| !used[k])
+            .map(|k| (geom::dist(pp, attach(&n.terminals[k]).0), k))
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+        let (d, k) = best.ok_or("no pads to pair up")?;
+        if d > 10.0 {
+            return Err(format!("{} has no pad of the other net within 10 mm", t.label));
+        }
+        used[k] = true;
+        let (np, nlay) = attach(&n.terminals[k]);
+        let layers: Vec<usize> = pl.iter().cloned().filter(|l| nlay.contains(l)).collect();
+        if layers.is_empty() {
+            return Err(format!(
+                "{} and {} are on different layers",
+                t.label, n.terminals[k].label
+            ));
+        }
+        ends.push(PairEnd {
+            label: format!("{} / {}", t.label, n.terminals[k].label),
+            p: pp,
+            n: np,
+            layers,
+            piece_p,
+            piece_n: k,
+        });
+    }
+    // a pair is a chain, not a tree: from the outermost end, nearest next
+    let mid = |e: &PairEnd| ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
+    let c = (
+        ends.iter().map(|e| mid(e).0).sum::<f64>() / ends.len() as f64,
+        ends.iter().map(|e| mid(e).1).sum::<f64>() / ends.len() as f64,
+    );
+    let first = (0..ends.len())
+        .max_by(|&a, &b| {
+            geom::dist(mid(&ends[a]), c)
+                .partial_cmp(&geom::dist(mid(&ends[b]), c))
+                .unwrap()
+                .then(b.cmp(&a))
+        })
+        .unwrap_or(0);
+    let mut order = vec![ends.remove(first)];
+    while !ends.is_empty() {
+        let at = mid(&order[order.len() - 1]);
+        let k = (0..ends.len())
+            .min_by(|&a, &b| {
+                geom::dist(mid(&ends[a]), at)
+                    .partial_cmp(&geom::dist(mid(&ends[b]), at))
+                    .unwrap()
+                    .then(a.cmp(&b))
+            })
+            .unwrap();
+        order.push(ends.remove(k));
+    }
+    Ok(order)
 }
 
 /// A cell a job's track may end on to reach a piece: its A* state and, when
@@ -263,6 +431,12 @@ struct Laid {
     vias: Vec<P>,
     unrouted: Vec<String>,
     necked: Vec<(String, f64)>,
+    /// For a pair: the negative net's tracks, each net's real vias (true: the
+    /// negative net's), and the length routed side by side.
+    tracks_n: Vec<(usize, Vec<P>, f64)>,
+    real_vias: Vec<(P, bool)>,
+    coupled: f64,
+    leg: Option<pair::Leg>,
 }
 
 // ------------------------------------------------------------------- A*
@@ -464,6 +638,13 @@ struct Router<'a> {
     work: Work,
     clr_cache: HashMap<(String, &'static str, Option<String>, &'static str, Option<u64>), f64>,
     cache_ok: bool,
+    /// Jobs in play. The jobs that route a stretch of a pair one net at a time
+    /// sleep unless the pair cannot be had there.
+    active: Vec<bool>,
+    /// job -> the other jobs that share a net with it (stretches of one pair)
+    sibs: Vec<Vec<usize>>,
+    /// (positive net, why) for each stretch of a pair that was routed one by one
+    pair_notes: Vec<(String, String)>,
     ngroups: usize,
     /// Inner layers given over to a pour: no tracks there, so the plane stays whole.
     planes: Vec<usize>,
@@ -579,13 +760,22 @@ impl<'a> Router<'a> {
         let mut owed = vec![0f32; self.obstacles.len()];
         // the rules are asked once for each group of like obstacles: (for a track, for a via)
         let mut asked: Vec<Option<(f64, f64)>> = vec![None; self.ngroups];
+        // a pair keeps its coupled part off its own two nets' pads (they are reached
+        // by a piece of track each, not by the pair as a whole)
+        let pair = self.jobs[j].pair.as_ref().map(|p| (p.net_n.clone(), p.pn));
         for (o, ob) in self.obstacles.iter().enumerate() {
-            if ob.net.as_deref() == Some(net.as_str()) {
+            let own = ob.net.as_deref() == Some(net.as_str())
+                || pair
+                    .as_ref()
+                    .map(|(n, _)| ob.net.as_deref() == Some(n.as_str()))
+                    .unwrap_or(false);
+            if own && pair.is_none() {
                 continue;
             }
-            let (ct, cv) = match asked[ob.group] {
-                Some(v) => v,
-                None => {
+            let (ct, cv) = match (own, &pair, asked[ob.group]) {
+                (true, Some((_, pn)), _) => (*pn, *pn),
+                (_, _, Some(v)) => v,
+                _ => {
                     let other = Item {
                         net: ob.net.as_deref(),
                         kind: Some(ob.kind),
@@ -669,10 +859,11 @@ impl<'a> Router<'a> {
             self.hard(j);
         }
         let net = self.jobs[j].net.as_str();
+        let partner = self.jobs[j].pair.as_ref().map(|p| p.net_n.as_str());
         let owed = &self.owed[j];
         let mut near: Vec<(usize, f64)> = Vec::new();
         for (o, ob) in self.obstacles.iter().enumerate() {
-            if ob.net.as_deref() == Some(net) {
+            if ob.net.as_deref() == Some(net) || (partner.is_some() && ob.net.as_deref() == partner) {
                 continue;
             }
             let bb = ob.shape.bbox();
@@ -776,20 +967,7 @@ impl<'a> Router<'a> {
         let mut all: Vec<Vec<Entry2>> = Vec::new();
         for t in 0..self.jobs[j].terminals.len() {
             let parts = self.jobs[j].terminals[t].parts.clone();
-            // loose ends of the piece's tracks: (point, layer, track width)
-            let mut loose: Vec<(P, usize, f64)> = Vec::new();
-            for (i, (shape, layers, is_pad)) in parts.iter().enumerate() {
-                if let (Shape::Capsule { a, b, r }, false) = (shape, *is_pad) {
-                    for end in [*a, *b] {
-                        let held = parts.iter().enumerate().any(|(k, (other, ol, _))| {
-                            k != i && layers.iter().any(|l| ol.contains(l)) && other.dist(end) <= 1e-6
-                        });
-                        if !held {
-                            loose.push((end, layers[0], 2.0 * r));
-                        }
-                    }
-                }
-            }
+            let loose = loose_ends(&parts);
             let mut st: Vec<Entry2> = Vec::new();
             for &(end, l, _) in &loose {
                 if !self.layers_ok(l) {
@@ -921,8 +1099,15 @@ impl<'a> Router<'a> {
         Some(c + half + self.jobs[j].margin)
     }
 
+    /// The cells, per layer and each once, within r of job k's copper.
     fn contribution(&mut self, k: usize, r: f64) -> Vec<Vec<u32>> {
-        let key = um(r);
+        self.contribution_of(k, r, 0)
+    }
+
+    /// The same for part of job k's copper: 0 all of it, 1 the tracks of its
+    /// (positive) net, 2 the tracks of a pair's negative net, 3 its vias.
+    fn contribution_of(&mut self, k: usize, r: f64, part: u8) -> Vec<Vec<u32>> {
+        let key = um(r) * 4 + part as i64;
         if let Some(c) = self.contrib[k].get(&key) {
             return c.clone();
         }
@@ -930,7 +1115,14 @@ impl<'a> Router<'a> {
         let mark = self.work.next_mark();
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); nl];
         if let Some(laid) = &self.laid[k] {
-            for (l, pts, w) in &laid.tracks {
+            let none: Vec<(usize, Vec<P>, f64)> = Vec::new();
+            let (first, second) = match part {
+                0 => (&laid.tracks, &laid.tracks_n),
+                1 => (&laid.tracks, &none),
+                2 => (&laid.tracks_n, &none),
+                _ => (&none, &none),
+            };
+            for (l, pts, w) in first.iter().chain(second.iter()) {
                 for s in pts.windows(2) {
                     let sh = Shape::Capsule {
                         a: s[0],
@@ -946,7 +1138,7 @@ impl<'a> Router<'a> {
                     });
                 }
             }
-            if let Some((d, _)) = self.jobs[k].via {
+            if let (Some((d, _)), true) = (self.jobs[k].via, part == 0 || part == 3) {
                 for &p in &laid.vias {
                     let sh = Shape::Circle { c: p, r: d / 2.0 };
                     for l in 0..nl {
@@ -963,6 +1155,44 @@ impl<'a> Router<'a> {
         }
         self.contrib[k].insert(key, out.clone());
         out
+    }
+
+    /// The part of sibling k's copper that is job j's own net (see `sibs`), as
+    /// (the part that is shared, the parts that are not). None: all of it is.
+    fn shared_with(&self, j: usize, k: usize) -> Option<(u8, [u8; 2])> {
+        match (&self.jobs[j].pair, &self.jobs[k].pair) {
+            (None, Some(_)) => Some(if self.jobs[k].net == self.jobs[j].net {
+                (1, [2, 3])
+            } else {
+                (2, [1, 3])
+            }),
+            _ => None,
+        }
+    }
+
+    /// The cells within r of sibling k's copper that job j need not keep clear
+    /// of, being its own net's: all of them, or for one net against a pair,
+    /// those near its own net's track and not near the other's.
+    fn own_in_sibling(&mut self, j: usize, k: usize, r: f64) -> Vec<Vec<u32>> {
+        match self.shared_with(j, k) {
+            None => self.contribution(k, r),
+            Some((mine, others)) => {
+                let (nl, n) = (self.gr.nl, self.gr.n);
+                let mut theirs = vec![false; n * nl];
+                for part in others {
+                    for (l, cells) in self.contribution_of(k, r, part).iter().enumerate() {
+                        for &c in cells {
+                            theirs[l * n + c as usize] = true;
+                        }
+                    }
+                }
+                self.contribution_of(k, r, mine)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(l, cells)| cells.into_iter().filter(|&c| !theirs[l * n + c as usize]).collect())
+                    .collect()
+            }
+        }
     }
 
     fn occupancy(&mut self, sig: usize, r: f64) -> (usize, i64) {
@@ -1057,6 +1287,29 @@ impl<'a> Router<'a> {
             }
             if let Some(rv) = self.radius(j, sig, true) {
                 let c = self.contribution(j, rv);
+                for l in 0..nl {
+                    for &cell in &c[l] {
+                        sv[cell as usize] = sv[cell as usize].saturating_sub(1);
+                    }
+                }
+            }
+        }
+        // other stretches of the same pair: copper of this job's own net is no obstacle
+        for k in self.sibs[j].clone() {
+            if self.laid[k].is_none() {
+                continue;
+            }
+            let sig = self.jobs[k].sig;
+            if let Some(rt) = self.radius(j, sig, false) {
+                let c = self.own_in_sibling(j, k, rt);
+                for l in 0..nl {
+                    for &cell in &c[l] {
+                        soft[l][cell as usize] = soft[l][cell as usize].saturating_sub(1);
+                    }
+                }
+            }
+            if let Some(rv) = self.radius(j, sig, true) {
+                let c = self.own_in_sibling(j, k, rv);
                 for l in 0..nl {
                     for &cell in &c[l] {
                         sv[cell as usize] = sv[cell as usize].saturating_sub(1);
@@ -1217,13 +1470,26 @@ impl<'a> Router<'a> {
                 continue;
             }
             let sig = self.jobs[k].sig;
+            let sibling = self.sibs[j].contains(&k);
+            if sibling && self.shared_with(j, k).is_none() {
+                continue; // all of it is this job's own net
+            }
             let mut hit = false;
             for (via, bit) in [(false, 1u8), (true, 2u8)] {
                 if hit {
                     break;
                 }
                 if let Some(r) = self.radius(j, sig, via) {
-                    let c = self.contribution(k, r);
+                    let c = match (sibling, self.shared_with(j, k)) {
+                        (true, Some((_, others))) => {
+                            let mut both = self.contribution_of(k, r, others[0]);
+                            for (l, more) in self.contribution_of(k, r, others[1]).into_iter().enumerate() {
+                                both[l].extend(more);
+                            }
+                            both
+                        }
+                        _ => self.contribution(k, r),
+                    };
                     hit = c
                         .iter()
                         .enumerate()
@@ -1237,7 +1503,356 @@ impl<'a> Router<'a> {
         out
     }
 
+    /// Whether a leg's copper keeps every clearance: to other nets' copper
+    /// (`near`) and the board edge, between the pair's two tracks, and from
+    /// each track to the other net's own pads.
+    fn pair_legal(&self, j: usize, spec: &PairSpec, leg: &pair::Leg, near: &[(usize, f64)]) -> Result<(), String> {
+        self.pair_legal_with(j, spec, leg, near, 0.0)
+    }
+
+    /// `slack`: extra room to ask for around other nets' copper (when testing a
+    /// place the tracks will only roughly keep to).
+    fn pair_legal_with(
+        &self,
+        j: usize,
+        spec: &PairSpec,
+        leg: &pair::Leg,
+        near: &[(usize, f64)],
+        slack: f64,
+    ) -> Result<(), String> {
+        let net_p = self.jobs[j].net.as_str();
+        let edge = self.rules.edge_clearance(net_p);
+        let hw = spec.w / 2.0;
+        let vr = spec.via.map(|v| v.0 / 2.0).unwrap_or(0.0);
+        for (lines, vias, other_net) in [(&leg.a, &leg.vias_a, spec.net_n.as_str()), (&leg.b, &leg.vias_b, net_p)] {
+            for (l, pts) in lines.iter() {
+                for s in pts.windows(2) {
+                    if !self.stub_ok(hw + slack, s[0], s[1], *l, near, edge) {
+                        return Err("its tracks would come too close to other copper at a corner or an end".into());
+                    }
+                    // the other net of the pair: its pads and kept tracks
+                    for ob in self.obstacles.iter().filter(|o| o.net.as_deref() == Some(other_net)) {
+                        if ob.layers.contains(l)
+                            && geom::seg_shape_dist(s[0], s[1], &ob.shape) < hw + slack + spec.pn - 1e-6
+                        {
+                            return Err("one track would come too close to the other net's pad".into());
+                        }
+                    }
+                }
+            }
+            for &v in vias.iter() {
+                for &(o, clr) in near {
+                    if self.obstacles[o].shape.dist(v) < clr + vr - 1e-6 {
+                        return Err("its vias would come too close to other copper".into());
+                    }
+                }
+                for ob in self.obstacles.iter().filter(|o| o.net.as_deref() == Some(other_net)) {
+                    if ob.shape.dist(v) < vr + spec.pn - 1e-6 {
+                        return Err("a via would come too close to the other net's pad".into());
+                    }
+                }
+            }
+        }
+        if pair::spacing(leg) < spec.w + spec.pn - 1e-6 {
+            return Err("its two tracks would come too close to each other at an end or a via".into());
+        }
+        // the other stretches of this pair: the corridor may share their space, so
+        // each track is held off the other net's copper there, exactly
+        for &k in &self.sibs[j] {
+            let other = match &self.laid[k] {
+                Some(l) => l,
+                None => continue,
+            };
+            let kn = self.jobs[k].pair.as_ref().map(|p| p.net_n.as_str());
+            let theirs: [(Option<&str>, &Vec<(usize, Vec<P>, f64)>); 2] =
+                [(Some(self.jobs[k].net.as_str()), &other.tracks), (kn, &other.tracks_n)];
+            for (mine, lines) in [(net_p, &leg.a), (spec.net_n.as_str(), &leg.b)] {
+                for (their_net, tracks) in theirs.iter() {
+                    if *their_net == Some(mine) || their_net.is_none() {
+                        continue;
+                    }
+                    for (l, pts) in lines.iter() {
+                        for s in pts.windows(2) {
+                            for (tl, tp, tw) in tracks.iter() {
+                                if tl != l {
+                                    continue;
+                                }
+                                for t in tp.windows(2) {
+                                    if geom::seg_seg_dist(s[0], s[1], t[0], t[1]) < hw + tw / 2.0 + spec.pn - 1e-6 {
+                                        return Err("it would come too close to the other net where two stretches of the pair meet".into());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (vias, lines) in [(&leg.vias_a, &leg.b), (&leg.vias_b, &leg.a)] {
+            for &v in vias.iter() {
+                for (_, pts) in lines.iter() {
+                    for s in pts.windows(2) {
+                        if geom::seg_dist(v, s[0], s[1]) < vr + hw + spec.pn - 1e-6 {
+                            return Err("a via would come too close to the other track".into());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where a pair's coupled part may begin or end, for each of its ends: free
+    /// cells a little way off the two pads, from which a straight piece of
+    /// track to each pad keeps every clearance.
+    fn pair_gates(&mut self, j: usize) -> Vec<Vec<Entry2>> {
+        if let Some(e) = &self.entries[j] {
+            return e.clone();
+        }
+        let n = self.gr.n;
+        let spec = self.jobs[j].pair.clone().expect("a pair job");
+        let (block, _) = self.hard(j);
+        let half = (spec.w + spec.gap) / 2.0;
+        let mut all: Vec<Vec<Entry2>> = Vec::new();
+        for e in &spec.ends {
+            let mid = ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
+            let apart = geom::dist(e.p, e.n);
+            let rmin = (0.5 * apart).max(1.5 * (spec.w + spec.gap));
+            let rmax = rmin + apart.max(3.0);
+            let near = self.near(j, (mid.0 - rmax, mid.1 - rmax, mid.0 + rmax, mid.1 + rmax), spec.w);
+            let mut cells: Vec<usize> = Vec::new();
+            self.gr.each(&Shape::Circle { c: mid, r: 0.0 }, rmax, |c| cells.push(c));
+            let mut st: Vec<Entry2> = Vec::new();
+            for c in cells {
+                let at = self.gr.xy(c);
+                let d = geom::dist(at, mid);
+                if d < rmin {
+                    continue;
+                }
+                // the two tracks arrive side by side, across the line from the pads
+                let side = (-(at.1 - mid.1) / d, (at.0 - mid.0) / d);
+                let (q1, q2) = (
+                    (at.0 + half * side.0, at.1 + half * side.1),
+                    (at.0 - half * side.0, at.1 - half * side.1),
+                );
+                let (qp, qn) = if geom::dist(e.p, q1) + geom::dist(e.n, q2) <= geom::dist(e.p, q2) + geom::dist(e.n, q1)
+                {
+                    (q1, q2)
+                } else {
+                    (q2, q1)
+                };
+                for &l in &e.layers {
+                    if !self.layers_ok(l) || block[l][c] != 0 {
+                        continue;
+                    }
+                    let try_ = pair::Leg {
+                        a: vec![(l, vec![e.p, qp])],
+                        b: vec![(l, vec![e.n, qn])],
+                        ..pair::Leg::default()
+                    };
+                    // (with room to spare: the tracks will arrive on the path's line, not
+                    // exactly the one tried here)
+                    if self.pair_legal_with(j, &spec, &try_, &near, 0.1).is_ok() {
+                        st.push(((l * n + c) as u32, None));
+                    }
+                }
+            }
+            st.sort_by(|a, b| a.0.cmp(&b.0));
+            all.push(st);
+        }
+        self.entries[j] = Some(all.clone());
+        all
+    }
+
+    /// Route a differential pair: one path down the middle for each leg of the
+    /// chain, as wide as both tracks and their gap, then the two tracks either
+    /// side of it. Any leg that cannot be done leaves the pair unrouted (and the
+    /// caller routes the two nets one by one instead).
+    fn route_pair(&mut self, j: usize, pres: f64, via_cost: f64, limit: usize, walls: bool) {
+        let (nl, n) = (self.gr.nl, self.gr.n);
+        let spec = self.jobs[j].pair.clone().expect("a pair job");
+        let (mut block, vhard) = self.hard(j);
+        let (soft, sv) = self.soft(j);
+        let mut vblock = vhard;
+        if walls {
+            for l in 0..nl {
+                for c in 0..n {
+                    if soft[l][c] > 0 {
+                        block[l][c] = 1;
+                    }
+                }
+            }
+            if let Some(vb) = vblock.as_mut() {
+                for c in 0..n {
+                    if sv[c] > 0 {
+                        vb[c] = 1;
+                    }
+                }
+            }
+        }
+        let gates: Vec<Vec<u32>> = self
+            .pair_gates(j)
+            .into_iter()
+            .map(|t| {
+                t.into_iter()
+                    .map(|e| e.0)
+                    .filter(|&s| block[s as usize / n][s as usize % n] == 0)
+                    .collect()
+            })
+            .collect();
+        let (half, via_half) = ((spec.w + spec.gap) / 2.0, spec.via_pitch / 2.0);
+        let mut laid = Laid::default();
+        let search_via = if vblock.is_some() { via_cost } else { 0.0 };
+        let hist = std::mem::take(&mut self.hist);
+        let mut stopped: Option<String> = None;
+        for k in 0..spec.ends.len().saturating_sub(1) {
+            let (ea, eb) = (&spec.ends[k], &spec.ends[k + 1]);
+            if stopped.is_none() {
+                for (e, g) in [(ea, &gates[k]), (eb, &gates[k + 1])] {
+                    if g.is_empty() && stopped.is_none() {
+                        stopped = Some(format!("no room near {} to bring the two tracks side by side", e.label));
+                    }
+                }
+            }
+            let mut done = false;
+            if stopped.is_none() {
+                let mid = ((eb.p.0 + eb.n.0) / 2.0, (eb.p.1 + eb.n.1) / 2.0);
+                let search = Search {
+                    block: &block,
+                    vblock: vblock.as_deref(),
+                    soft: &soft,
+                    soft_via: &sv,
+                    hist: &hist,
+                    pres,
+                    via_cost: search_via,
+                    limit,
+                };
+                match astar(&self.gr, &mut self.work, &search, &gates[k], &gates[k + 1], mid) {
+                    None => stopped = Some("no way through wide enough for both tracks".into()),
+                    Some(path) => {
+                        // the centreline, per layer, corners only
+                        let mut runs: Vec<pair::Line> = Vec::new();
+                        for &s in &path {
+                            let (l, p) = (s as usize / n, self.gr.xy(s as usize % n));
+                            match runs.last_mut() {
+                                Some((rl, pts)) if *rl == l => {
+                                    if pts.len() >= 2 {
+                                        let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
+                                        if ((b.0 - a.0) * (p.1 - b.1) - (b.1 - a.1) * (p.0 - b.0)).abs() < 1e-9 {
+                                            pts.pop();
+                                        }
+                                    }
+                                    pts.push(p);
+                                }
+                                _ => {
+                                    // the next run starts where this one ends, a layer away
+                                    runs.push((l, vec![p]));
+                                }
+                            }
+                        }
+                        let mut bbox = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                        for q in runs
+                            .iter()
+                            .flat_map(|r| r.1.iter())
+                            .chain([ea.p, ea.n, eb.p, eb.n].iter())
+                        {
+                            bbox = (bbox.0.min(q.0), bbox.1.min(q.1), bbox.2.max(q.0), bbox.3.max(q.1));
+                        }
+                        let near = self.near(j, bbox, spec.via_pitch + spec.w + half);
+                        // the pair faces straight out from its first pads and straight in to its last
+                        let mid_of = |e: &PairEnd| ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
+                        let (g0, g1) = (
+                            self.gr.xy(path[0] as usize % n),
+                            self.gr.xy(path[path.len() - 1] as usize % n),
+                        );
+                        let toward = |a: P, b: P| {
+                            let d = geom::dist(a, b);
+                            if d > 1e-9 {
+                                Some(((b.0 - a.0) / d, (b.1 - a.1) / d))
+                            } else {
+                                None
+                            }
+                        };
+                        let heading = (toward(mid_of(ea), g0), toward(g1, mid_of(eb)));
+                        // which track runs on which side: try both; and if the path's first
+                        // or last step is too far off the way the pair faces, let the path decide
+                        let mut why = String::new();
+                        let mut leg: Option<pair::Leg> = None;
+                        'tries: for facing in [heading, (None, heading.1), (heading.0, None), (None, None)] {
+                            for first in [1.0, -1.0] {
+                                match pair::leg(
+                                    &runs,
+                                    half,
+                                    via_half,
+                                    spec.via_side,
+                                    first,
+                                    (ea.p, ea.n),
+                                    (eb.p, eb.n),
+                                    facing,
+                                )
+                                .and_then(|l| self.pair_legal(j, &spec, &l, &near).map(|_| l))
+                                {
+                                    Ok(l) => {
+                                        leg = Some(l);
+                                        break 'tries;
+                                    }
+                                    // (the last try is the most forgiving: its reason is the real one)
+                                    Err(e) => why = e,
+                                }
+                            }
+                        }
+                        if why.contains("too close to each other") {
+                            // both ways round were tried: the two nets do not line up
+                            why = "the two nets are the other way round at one end from the other (the tracks would have to cross), or its pads leave them no room to come together".into();
+                        }
+                        match leg {
+                            None => stopped = Some(why),
+                            Some(l) => {
+                                laid.tracks.extend(l.a.iter().map(|(ly, p)| (*ly, p.clone(), spec.w)));
+                                laid.tracks_n.extend(l.b.iter().map(|(ly, p)| (*ly, p.clone(), spec.w)));
+                                laid.real_vias.extend(l.vias_a.iter().map(|&v| (v, false)));
+                                laid.real_vias.extend(l.vias_b.iter().map(|&v| (v, true)));
+                                laid.vias.extend(l.centres.iter().cloned());
+                                laid.coupled += l.coupled;
+                                laid.leg = Some(l.clone());
+                                laid.paths.push(path);
+                                done = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !done {
+                laid.unrouted
+                    .push(format!("{}: {}", eb.label, stopped.clone().unwrap_or_default()));
+            }
+        }
+        self.hist = hist;
+        self.laid[j] = Some(laid);
+        self.contrib[j].clear();
+        self.add(j, 1);
+    }
+
+    /// Give up on routing job j as a pair: wake the two jobs that route its nets
+    /// one by one. Returns them, and why the pair did not work out.
+    fn unpair(&mut self, j: usize) -> (usize, usize, String) {
+        let why = self.laid[j]
+            .as_ref()
+            .and_then(|l| l.unrouted.first().cloned())
+            .unwrap_or_default();
+        self.rip(j);
+        let spec = self.jobs[j].pair.clone().expect("a pair job");
+        self.pair_notes.push((self.jobs[j].net.clone(), why.clone()));
+        self.active[j] = false;
+        self.active[spec.job_p] = true;
+        self.active[spec.job_n] = true;
+        (spec.job_p, spec.job_n, why)
+    }
+
     fn route_job(&mut self, j: usize, pres: f64, via_cost: f64, limit: usize, walls: bool) {
+        if self.jobs[j].pair.is_some() {
+            return self.route_pair(j, pres, via_cost, limit, walls);
+        }
         let (nl, n) = (self.gr.nl, self.gr.n);
         let (mut block, vhard) = self.hard(j);
         let (soft, sv) = self.soft(j);
@@ -1798,10 +2413,156 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             terminals,
             sig,
             span: (sx1 - sx0) + (sy1 - sy0),
+            pair: None,
         });
     }
     // short nets first: they have the fewest ways round
     jobs.sort_by(|a, b| a.span.partial_cmp(&b.span).unwrap().then(a.net.cmp(&b.net)));
+    // differential pairs. A pair is a chain of ends (connector, protection part,
+    // chip ...), and each stretch between two ends is a job of its own: routed as a
+    // pair where that can be had, with a job for each net asleep behind it for where
+    // it cannot. The jobs for the two whole nets are not used.
+    let mut asleep: Vec<usize> = Vec::new();
+    let mut pair_legs: Vec<(String, String, usize, f64, f64)> = Vec::new(); // (positive, negative, legs, width, gap)
+    if opt.diff_pairs {
+        let singles = jobs.len();
+        for i in 0..singles {
+            let other = match crate::rules::pair_partner(&jobs[i].net) {
+                Some((name, true)) => name,
+                _ => continue,
+            };
+            let k = match jobs[..singles].iter().position(|jb| jb.net == other) {
+                Some(k) => k,
+                None => continue,
+            };
+            if let Some(only) = &opt.only_pairs {
+                if !matches(only, &jobs[i].net) && !matches(only, &other) {
+                    continue;
+                }
+            }
+            let ends = match pair_ends(&jobs[i], &jobs[k]) {
+                Ok(e) => e,
+                Err(why) => {
+                    out.pairs.push(PairReport {
+                        positive: jobs[i].net.clone(),
+                        negative: other.clone(),
+                        as_pair: false,
+                        note: why,
+                        legs: 0,
+                        coupled_legs: 0,
+                        width: 0.0,
+                        gap: 0.0,
+                        coupled: 0.0,
+                        length_positive: 0.0,
+                        length_negative: 0.0,
+                    });
+                    continue;
+                }
+            };
+            let class = rules.class_of(&jobs[i].net);
+            let (ip, inn) = (Item::track(&jobs[i].net), Item::track(&other));
+            let between = rules.clearance(&ip, &inn);
+            let w = opt.pair_width.unwrap_or(if class.pair_width > 0.0 {
+                class.pair_width
+            } else {
+                jobs[i].width
+            });
+            let gap = opt
+                .pair_gap
+                .unwrap_or(if class.pair_gap > 0.0 { class.pair_gap } else { between });
+            let via = jobs[i].via;
+            let via_gap = if class.pair_via_gap > 0.0 {
+                class.pair_via_gap
+            } else {
+                gap.max(between)
+            };
+            let via_pitch = via
+                .map(|(d, h)| (d + via_gap).max(h + rules.hole_to_hole))
+                .unwrap_or(0.0);
+            let pn = gap.min(between);
+            // a via stands at least this far to its side of the path, so the other
+            // track (half a pitch to the other side) clears it; on a right-angle bend
+            // that takes vias 1.41 times as far apart, which is what room is kept for
+            let via_side = via
+                .map(|(d, _)| d / 2.0 + w / 2.0 + pn - (w + gap) / 2.0)
+                .unwrap_or(0.0);
+            let via_room = via_pitch.max(2.0 * via_side * SQRT2);
+            let width = 2.0 * w + gap;
+            pair_legs.push((jobs[i].net.clone(), other.clone(), ends.len() - 1, w, gap));
+            for leg in ends.windows(2) {
+                // the stretch one net at a time: two jobs of two pieces each
+                let one = |of: usize, a: usize, b: usize, jobs: &mut Vec<Job>| -> usize {
+                    let terminals = vec![jobs[of].terminals[a].clone(), jobs[of].terminals[b].clone()];
+                    let span = (terminals[0].centre.0 - terminals[1].centre.0).abs()
+                        + (terminals[0].centre.1 - terminals[1].centre.1).abs();
+                    let job = Job {
+                        net: jobs[of].net.clone(),
+                        width: jobs[of].width,
+                        via: jobs[of].via,
+                        margin: jobs[of].margin,
+                        neck: jobs[of].neck,
+                        terminals,
+                        sig: jobs[of].sig,
+                        span,
+                        pair: None,
+                    };
+                    jobs.push(job);
+                    jobs.len() - 1
+                };
+                let job_p = one(i, leg[0].piece_p, leg[1].piece_p, &mut jobs);
+                let job_n = one(k, leg[0].piece_n, leg[1].piece_n, &mut jobs);
+                let mut terminals = jobs[job_p].terminals.clone();
+                terminals.extend(jobs[job_n].terminals.iter().cloned());
+                let span = jobs[job_p].span.max(jobs[job_n].span);
+                let (net, sig) = (jobs[i].net.clone(), jobs[i].sig);
+                jobs.push(Job {
+                    net,
+                    width,
+                    // both vias as one: a disc that holds them whichever way the pair is heading
+                    via: via.map(|(d, h)| (via_room + d, h)),
+                    // (and room for the outer track's corners: mitred at a right angle
+                    // they stand a little outside the width the path was found for)
+                    margin: opt.margin.max(grid_margin(width / 2.0 + smallest, g)) + (SQRT2 - 1.0) * (w + gap) / 2.0,
+                    neck: None,
+                    terminals,
+                    sig,
+                    span,
+                    pair: Some(PairSpec {
+                        job_p,
+                        job_n,
+                        net_n: other.clone(),
+                        w,
+                        gap,
+                        via,
+                        via_pitch,
+                        via_side,
+                        pn,
+                        ends: leg.to_vec(),
+                    }),
+                });
+                asleep.push(job_p);
+                asleep.push(job_n);
+            }
+            asleep.push(i);
+            asleep.push(k);
+        }
+    }
+    // jobs that share a net (the stretches of a pair)
+    let nets_of = |jb: &Job| -> Vec<String> {
+        let mut v = vec![jb.net.clone()];
+        if let Some(p) = &jb.pair {
+            v.push(p.net_n.clone());
+        }
+        v
+    };
+    let sibs: Vec<Vec<usize>> = (0..jobs.len())
+        .map(|a| {
+            let mine = nets_of(&jobs[a]);
+            (0..jobs.len())
+                .filter(|&b| b != a && nets_of(&jobs[b]).iter().any(|n| mine.contains(n)))
+                .collect()
+        })
+        .collect();
     let nj = jobs.len();
     let cache_ok = rules.place_is_whole();
     let planes = if opt.tracks_on_planes {
@@ -1822,8 +2583,15 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             eprintln!("{}", out.log[out.log.len() - 1]);
         }
     }
+    let mut active = vec![true; nj];
+    for &j in &asleep {
+        active[j] = false;
+    }
     let mut r = Router {
         planes,
+        active,
+        sibs,
+        pair_notes: Vec::new(),
         ngroups,
         board,
         rules,
@@ -1851,9 +2619,37 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         r.gr.h,
         nl,
         g,
-        nj,
+        {
+            let mut nets: Vec<&str> = r.jobs.iter().map(|jb| jb.net.as_str()).collect();
+            nets.extend(
+                r.jobs
+                    .iter()
+                    .filter_map(|jb| jb.pair.as_ref().map(|p| p.net_n.as_str())),
+            );
+            nets.sort();
+            nets.dedup();
+            nets.len()
+        },
         out.skipped.len()
     ));
+    if !pair_legs.is_empty() {
+        r.say(format!(
+            "  differential pairs: {}",
+            pair_legs
+                .iter()
+                .map(|(p, n, legs, w, gap)| format!(
+                    "{} / {} ({} mm tracks, {} mm apart, {} stretch{})",
+                    p,
+                    n,
+                    w,
+                    gap,
+                    legs,
+                    if *legs == 1 { "" } else { "es" }
+                ))
+                .collect::<Vec<String>>()
+                .join("; ")
+        ));
+    }
     let widest = r.jobs.iter().map(|j| j.margin).fold(0.0, f64::max);
     if widest > opt.margin + 1e-9 {
         r.say(format!(
@@ -1863,17 +2659,34 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
     }
 
     let mut pres = 0.5;
-    let mut todo: Vec<usize> = (0..nj).collect();
+    let mut todo: Vec<usize> = (0..nj).filter(|&j| r.active[j]).collect();
     let mut best: Option<usize> = None;
     let mut since = 0;
     let mut conflicts: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
     for pass in 1..=opt.passes {
-        for &j in &todo {
+        let mut at = 0;
+        while at < todo.len() {
+            let j = todo[at];
+            at += 1;
+            if !r.active[j] {
+                continue;
+            }
             r.rip(j);
             r.route_job(j, pres, opt.via_cost, opt.limit, false);
             if !r.laid[j].as_ref().unwrap().unrouted.is_empty() {
                 r.rip(j);
                 r.route_job(j, pres, opt.via_cost / 2.0, opt.limit * 5, false);
+            }
+            // a pair that cannot be had even with nothing else in its way: the two nets
+            // are routed one by one, further on in this pass
+            if r.jobs[j].pair.is_some() && !r.laid[j].as_ref().unwrap().unrouted.is_empty() {
+                let (p, n, why) = r.unpair(j);
+                r.say(format!(
+                    "  {} / {} not routed as a pair ({}); routing them one by one",
+                    r.jobs[p].net, r.jobs[n].net, why
+                ));
+                todo.push(p);
+                todo.push(n);
             }
         }
         conflicts.clear();
@@ -1940,6 +2753,18 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             r.rip(j);
             if round < 5 {
                 r.route_job(j, pres, opt.via_cost, opt.limit * 4, true);
+                if r.jobs[j].pair.is_some() && !r.laid[j].as_ref().unwrap().unrouted.is_empty() {
+                    // squeezed out as a pair: the two nets go in one by one
+                    let (p, n, why) = r.unpair(j);
+                    r.say(format!(
+                        "  {} / {} not routed as a pair ({}); routing them one by one",
+                        r.jobs[p].net, r.jobs[n].net, why
+                    ));
+                    for k in [p, n] {
+                        r.route_job(k, pres, opt.via_cost, opt.limit * 4, true);
+                    }
+                    continue;
+                }
                 // squeezed out? Then it goes first and the ones in its way go round it,
                 // if that leaves less unjoined
                 let left = |r: &Router, k: usize| r.laid[k].as_ref().map(|l| l.unrouted.len()).unwrap_or(0);
@@ -1994,10 +2819,41 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         }
     }
 
+    // the stretches of a pair were each checked against the others as they stood
+    // then; check them as they stand now, and route one by one any that fail
+    loop {
+        let mut failed: Option<usize> = None;
+        for j in 0..nj {
+            if !r.active[j] || r.jobs[j].pair.is_none() {
+                continue;
+            }
+            let (spec, leg) = match (r.jobs[j].pair.clone(), r.laid[j].as_ref().and_then(|l| l.leg.clone())) {
+                (Some(s), Some(l)) => (s, l),
+                _ => continue,
+            };
+            if r.pair_legal(j, &spec, &leg, &[]).is_err() {
+                failed = Some(j);
+                break;
+            }
+        }
+        let j = match failed {
+            Some(j) => j,
+            None => break,
+        };
+        if let Some(l) = r.laid[j].as_mut() {
+            l.unrouted
+                .push("it came too close to the other net where two stretches of the pair meet".into());
+        }
+        let (p, n, _) = r.unpair(j);
+        for k in [p, n] {
+            r.route_job(k, pres, opt.via_cost, opt.limit * 4, true);
+        }
+    }
+
     // wide tracks: a second via beside each via
     if opt.double_vias > 0.0 {
         for j in 0..nj {
-            if r.jobs[j].width >= opt.double_vias - 1e-9 {
+            if r.active[j] && r.jobs[j].pair.is_none() && r.jobs[j].width >= opt.double_vias - 1e-9 {
                 let (added, single) = r.double_vias(j);
                 out.doubled += added;
                 let net = r.jobs[j].net.clone();
@@ -2014,36 +2870,116 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         }
     }
 
+    let length = |tracks: &[(usize, Vec<P>, f64)]| -> f64 {
+        tracks
+            .iter()
+            .map(|(_, p, _)| p.windows(2).map(|s| geom::dist(s[0], s[1])).sum::<f64>())
+            .sum()
+    };
+    // a net may be the work of several jobs (the stretches of a pair): one report for it
+    let mut reports: Vec<NetReport> = Vec::new();
+    let mut lengths: BTreeMap<String, f64> = BTreeMap::new();
+    let mut coupled: BTreeMap<String, (usize, f64)> = BTreeMap::new(); // positive net -> (stretches, mm)
+    let report = |net: &str, width: f64, pieces: usize, laid: &Laid, reports: &mut Vec<NetReport>| match reports
+        .iter_mut()
+        .find(|n| n.net == net)
+    {
+        Some(n) => {
+            n.pieces += pieces - 1;
+            n.unrouted.extend(laid.unrouted.iter().cloned());
+            n.necked.extend(laid.necked.iter().cloned());
+        }
+        None => reports.push(NetReport {
+            net: net.to_string(),
+            width,
+            necked: laid.necked.clone(),
+            pieces,
+            unrouted: laid.unrouted.clone(),
+        }),
+    };
     for j in 0..nj {
+        if !r.active[j] {
+            continue;
+        }
         let job = &r.jobs[j];
         let laid = r.laid[j].clone().unwrap_or_default();
-        for (l, pts, w) in &laid.tracks {
-            for s in pts.windows(2) {
-                out.tracks.push(NewTrack {
-                    net: job.net.clone(),
-                    layer: *l,
-                    a: s[0],
-                    b: s[1],
-                    width: *w,
-                });
+        let partner = job.pair.as_ref().map(|p| p.net_n.clone());
+        for (net, tracks) in [(Some(job.net.clone()), &laid.tracks), (partner.clone(), &laid.tracks_n)] {
+            let net = match net {
+                Some(n) => n,
+                None => continue,
+            };
+            *lengths.entry(net.clone()).or_insert(0.0) += length(tracks);
+            for (l, pts, w) in tracks.iter() {
+                for s in pts.windows(2) {
+                    out.tracks.push(NewTrack {
+                        net: net.clone(),
+                        layer: *l,
+                        a: s[0],
+                        b: s[1],
+                        width: *w,
+                    });
+                }
             }
         }
-        if let Some((d, drill)) = job.via {
-            for &p in &laid.vias {
-                out.vias.push(NewVia {
-                    net: job.net.clone(),
-                    at: p,
-                    diameter: d,
-                    drill,
-                });
+        match &job.pair {
+            None => {
+                if let Some((d, drill)) = job.via {
+                    for &p in &laid.vias {
+                        out.vias.push(NewVia {
+                            net: job.net.clone(),
+                            at: p,
+                            diameter: d,
+                            drill,
+                        });
+                    }
+                }
+                report(&job.net, job.width, job.terminals.len(), &laid, &mut reports);
+            }
+            Some(spec) => {
+                if let Some((d, drill)) = spec.via {
+                    for &(p, negative) in &laid.real_vias {
+                        out.vias.push(NewVia {
+                            net: if negative { spec.net_n.clone() } else { job.net.clone() },
+                            at: p,
+                            diameter: d,
+                            drill,
+                        });
+                    }
+                }
+                for net in [&job.net, &spec.net_n] {
+                    report(net, spec.w, spec.ends.len(), &laid, &mut reports);
+                }
+                if laid.unrouted.is_empty() {
+                    let e = coupled.entry(job.net.clone()).or_insert((0, 0.0));
+                    e.0 += 1;
+                    e.1 += laid.coupled;
+                }
             }
         }
-        out.nets.push(NetReport {
-            net: job.net.clone(),
-            width: job.width,
-            necked: laid.necked.clone(),
-            pieces: job.terminals.len(),
-            unrouted: laid.unrouted.clone(),
+    }
+    out.nets.extend(reports);
+    for (positive, negative, legs, w, gap) in &pair_legs {
+        let (done, mm) = coupled.get(positive).cloned().unwrap_or((0, 0.0));
+        let mut why: Vec<String> = r
+            .pair_notes
+            .iter()
+            .filter(|(p, _)| p == positive)
+            .map(|(_, w)| w.clone())
+            .collect();
+        why.dedup();
+        out.pairs.push(PairReport {
+            positive: positive.clone(),
+            negative: negative.clone(),
+            as_pair: done > 0,
+            note: why.join("; "),
+            legs: *legs,
+            coupled_legs: done,
+            width: *w,
+            gap: *gap,
+            coupled: mm,
+            length_positive: lengths.get(positive).cloned().unwrap_or(0.0),
+            length_negative: lengths.get(negative).cloned().unwrap_or(0.0),
         });
     }
     out.log.append(&mut r.log);
@@ -2484,6 +3420,113 @@ mod tests {
         assert!(r.complete(), "{:?}", r.nets);
         assert!(r.tracks.iter().all(|t| t.layer != 1), "a track was laid on the plane");
         assert!(!r.vias.is_empty());
+    }
+
+    /// A two-layer board with a D+ / D- pair to join across it, 0.8 mm apart at each end.
+    fn pair_board(extra: &str) -> Board {
+        let s = String::from(HEAD)
+            + &smd("J1", "D+", 3.0, 9.6, 0.5, 0.5)
+            + &smd("J2", "D-", 3.0, 10.4, 0.5, 0.5)
+            + &smd("U1", "D+", 27.0, 9.6, 0.5, 0.5)
+            + &smd("U2", "D-", 27.0, 10.4, 0.5, 0.5)
+            + extra
+            + "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
+        Board::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_differential_pair_runs_side_by_side() {
+        // another net's pad stands in the straight line between the two ends
+        let b = pair_board(&smd("X", "OTHER", 15.0, 10.0, 3.0, 3.0));
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert_eq!(r.pairs.len(), 1);
+        let p = &r.pairs[0];
+        assert!(p.as_pair, "{}", p.note);
+        assert_eq!((p.positive.as_str(), p.negative.as_str()), ("D+", "D-"));
+        assert_eq!((p.width, p.gap), (0.25, 0.2));
+        assert_eq!((p.legs, p.coupled_legs), (1, 1));
+        assert_eq!(r.nets.len(), 2, "one report for each net: {:?}", r.nets);
+        assert!(p.coupled > 15.0, "only {:.1} mm side by side", p.coupled);
+        assert!((p.length_positive - p.length_negative).abs() < 3.0);
+        for net in ["D+", "D-"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        // along the coupled part the two tracks are exactly a pitch apart, never nearer
+        let (dp, dn): (Vec<&NewTrack>, Vec<&NewTrack>) = r.tracks.iter().partition(|t| t.net == "D+");
+        let mut least = f64::INFINITY;
+        for a in &dp {
+            for c in &dn {
+                if a.layer == c.layer {
+                    least = least.min(geom::seg_seg_dist(a.a, a.b, c.a, c.b));
+                }
+            }
+        }
+        assert!(
+            (least - 0.45).abs() < 1e-6,
+            "the tracks' centre lines come {:.3} mm apart",
+            least
+        );
+        assert!(r.vias.is_empty());
+        // and it can be turned off
+        let off = route(
+            &b,
+            &rules(),
+            &Options {
+                diff_pairs: false,
+                ..Options::default()
+            },
+        );
+        assert!(off.pairs.is_empty() && off.complete());
+    }
+
+    #[test]
+    fn a_pair_changes_layer_with_a_via_each() {
+        // a track of another net runs right across the front between the two ends
+        let wall = smd("W1", "WALL", 15.0, 1.0, 0.8, 0.8)
+            + &smd("W2", "WALL", 15.0, 19.0, 0.8, 0.8)
+            + "(segment (start 15 1) (end 15 19) (width 0.25) (layer \"F.Cu\") (net \"WALL\"))\n";
+        let b = pair_board(&wall);
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(r.pairs[0].as_pair, "{}", r.pairs[0].note);
+        assert_eq!(r.vias.len(), 4, "down and up again, a via for each track each time");
+        assert_eq!(r.vias.iter().filter(|v| v.net == "D+").count(), 2);
+        for net in ["D+", "D-"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        // the two holes of a pair keep the board's hole-to-hole gap
+        for (i, v) in r.vias.iter().enumerate() {
+            for u in &r.vias[i + 1..] {
+                assert!(geom::dist(v.at, u.at) >= 0.3 + 0.5 - 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn nets_that_do_not_pair_up_are_routed_one_by_one() {
+        // D- has a third pad that D+ has no partner for
+        let b = pair_board(&smd("T", "D-", 15.0, 16.0, 0.5, 0.5));
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert_eq!(r.pairs.len(), 1);
+        assert!(!r.pairs[0].as_pair);
+        assert!(r.pairs[0].note.contains("pieces"), "{}", r.pairs[0].note);
+        assert_eq!((r.pairs[0].legs, r.pairs[0].coupled_legs), (0, 0));
+        for net in ["D+", "D-"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert!(smallest_gap(&b, &r) >= 0.2 - 1e-6);
     }
 
     #[test]
