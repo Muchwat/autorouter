@@ -4,7 +4,8 @@
 //!   with net assignments and wildcard patterns.
 //! * The board minimums from the `.kicad_pro`: clearance and copper-to-edge.
 //! * Custom rules from the `.kicad_dru`: `clearance`, `track_width`,
-//!   `edge_clearance` and `disallow via` constraints, with their conditions.
+//!   `edge_clearance` and `disallow` (`via`, `through_via`, `blind_via`,
+//!   `buried_via`) constraints, with their conditions.
 //!
 //! Conditions are evaluated with three values: true, false and "can't tell"
 //! (a test the router cannot answer, such as where a track will run). A rule
@@ -188,12 +189,26 @@ enum Val {
     Num(f64),
 }
 
+/// The kinds of via a rule can forbid one by one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ViaKind {
+    /// From the top layer to the bottom.
+    Through,
+    /// From an outer layer to an inner one.
+    Blind,
+    /// Between inner layers only.
+    Buried,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     Clearance,
     TrackWidth,
     EdgeClearance,
     DisallowVia,
+    DisallowThrough,
+    DisallowBlind,
+    DisallowBuried,
     /// The length of a net's tracks: `min`, `opt`, `max`.
     Length,
     /// How far apart in length the two halves of a differential pair may be: `max`.
@@ -424,11 +439,23 @@ impl Rules {
                     Some("diff_pair_gap") => Kind::PairGap,
                     Some("skew") => Kind::Skew,
                     Some("disallow") => {
-                        if c.args().iter().skip(1).any(|a| *a == "via" || *a == "through_via") {
-                            Kind::DisallowVia
-                        } else {
-                            continue;
+                        // one constraint may name several things; each kind of via is one of ours
+                        for a in c.args().iter().skip(1) {
+                            let kind = match *a {
+                                "via" => Kind::DisallowVia,
+                                "through_via" => Kind::DisallowThrough,
+                                "blind_via" => Kind::DisallowBlind,
+                                "buried_via" => Kind::DisallowBuried,
+                                _ => continue,
+                            };
+                            constraints.push(Constraint {
+                                kind,
+                                min: None,
+                                opt: None,
+                                max: None,
+                            });
                         }
+                        continue;
                     }
                     _ => continue,
                 };
@@ -848,18 +875,33 @@ impl Rules {
         }
     }
 
-    /// (diameter, drill) of this net's vias, or None when its rules forbid them.
+    /// (diameter, drill) of this net's vias, or None when its rules forbid
+    /// every kind of via.
     pub fn via(&self, net: &str) -> Option<(f64, f64)> {
-        let it = Item::via(net);
-        for rule in &self.rules {
-            if rule.constraints.iter().any(|c| c.kind == Kind::DisallowVia)
-                && self.applies(rule, &it, &it, false) != T::No
-            {
-                return None;
-            }
+        if ![ViaKind::Through, ViaKind::Blind, ViaKind::Buried]
+            .iter()
+            .any(|k| self.via_allowed(net, *k))
+        {
+            return None;
         }
         let c = self.class_of(net);
         Some((c.via_diameter, c.via_drill))
+    }
+
+    /// Whether this net's rules let it have a via of this kind.
+    pub fn via_allowed(&self, net: &str, kind: ViaKind) -> bool {
+        let it = Item::via(net);
+        let own = match kind {
+            ViaKind::Through => Kind::DisallowThrough,
+            ViaKind::Blind => Kind::DisallowBlind,
+            ViaKind::Buried => Kind::DisallowBuried,
+        };
+        !self.rules.iter().any(|rule| {
+            rule.constraints
+                .iter()
+                .any(|c| c.kind == Kind::DisallowVia || c.kind == own)
+                && self.applies(rule, &it, &it, false) != T::No
+        })
     }
 
     pub fn edge_clearance(&self, net: &str) -> f64 {
@@ -1202,6 +1244,25 @@ mod tests {
         r.read_dru(DRU).unwrap();
         r.courtyards.insert("Q4".into(), (10.0, 10.0, 20.0, 20.0));
         r
+    }
+
+    #[test]
+    fn rules_forbid_vias_by_kind() {
+        let mut r = Rules::default();
+        r.read_dru(
+            "(version 1)\n(rule \"a\" (constraint disallow blind_via buried_via) (condition \"A.NetName == 'A'\"))\n\
+             (rule \"b\" (constraint disallow through_via) (condition \"A.NetName == 'B'\"))\n\
+             (rule \"c\" (constraint disallow via) (condition \"A.NetName == 'C'\"))\n\
+             (rule \"d\" (constraint disallow track) (condition \"A.NetName == 'D'\"))\n",
+        )
+        .unwrap();
+        let allowed = |net: &str| [ViaKind::Through, ViaKind::Blind, ViaKind::Buried].map(|k| r.via_allowed(net, k));
+        assert_eq!(allowed("A"), [true, false, false]);
+        assert_eq!(allowed("B"), [false, true, true]);
+        assert_eq!(allowed("C"), [false, false, false], "\"via\" is every kind of via");
+        assert_eq!(allowed("D"), [true, true, true]);
+        assert!(r.via("A").is_some() && r.via("B").is_some() && r.via("D").is_some());
+        assert!(r.via("C").is_none());
     }
 
     #[test]

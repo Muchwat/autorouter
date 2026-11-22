@@ -22,10 +22,11 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **Wide tracks get two vias.** A track of 0.8 mm or more gets a second via beside each via, joined on both layers, so one small hole is not the weak point of a power path (`--double-vias`). Where there is no room, the via is listed.
 - **Differential pairs.** Nets named as a pair the way KiCad reads names (`D+`/`D-`, `CLK_P`/`CLK_N`, `TXP`/`TXN`, with any trailing digits), or as `DP`/`DM`, are routed side by side at a constant gap, with a via each where they change layer and a short piece each into their pads. A pair is done stretch by stretch between its parts: a stretch that cannot be had as a pair (the two nets the other way round at its ends, a part that splits them) is routed one net at a time, and the summary says which and why. Width and gap come from the net class's pair settings, or `--pair W/GAP`; `--no-diff-pairs` turns it off. The two halves can be brought to the same length (see below).
 - **A width and a clearance per layer.** A rule may be for some layers only: a `(layer "In1.Cu")`, `(layer outer)` or `(layer inner)` clause, or a condition on `A.Layer`. So a controlled-impedance net can be one width on the outer layers and another inside, and a track changes width where it changes layer. The same goes for a differential pair's width and gap, and for clearances.
+- **Blind and buried vias, where you allow them.** Name the vias your board house makes, each by the two layers it joins (`--via-spans F.Cu-In1.Cu,In2.Cu-B.Cu`, or `--blind-vias` for any), and the router uses them beside through vias. Such a via takes up room only on the layers it joins: a track of another net may pass under it on a layer it does not reach, and two vias that share no layer may sit at the same spot. A differential pair may change layer with them too. They are written the way KiCad writes them (`blind`, `buried`), and a board that already has some is read with each via on its own layers. Off by default, since they cost more to make.
 - **Length matching.** Where a rule or an option asks, a track is lengthened with meanders: square bumps on its straight sides, each one kept only if it stays clear of other nets by the track's own clearances and a track's width or more from the rest of its own net. The two halves of a differential pair are brought within their skew (a `skew` rule, or `--skew`), a net up to the least length a `length` rule asks, and a group of nets up to the longest of them (`--match-length`). Lengths come out exact, not to the nearest grid step. The router never shortens a track; a net over a rule's maximum, or with no room for its meanders, is reported with what it lacks.
 - **It says why.** A piece left unjoined comes with a reason: no clear way in at that width, shut in by other copper with so many square millimetres of room, or no path between other nets' copper.
 - **The real board shape.** The outline (lines, arcs, circles, rectangles, polygons, Bezier curves, and edge cuts inside footprints), non-plated holes and milled slots, and keep-out areas are walls. An outline that is not closed is reported, and the board is routed without it.
-- **Any number of copper layers,** with through vias. An inner layer that a pour covers is treated as a plane and kept free of tracks, unless you pass `--tracks-on-planes`. Every track starts and ends on its pad's centre.
+- **Any number of copper layers.** An inner layer that a pour covers is treated as a plane and kept free of tracks, unless you pass `--tracks-on-planes`. Every track starts and ends on its pad's centre.
 - **KiCad 7 to 10 files,** both the numbered nets of KiCad 7 to 9 and the named nets of KiCad 10. Only new items are added and replaced ones cut out; the rest of the file stays byte for byte as KiCad wrote it.
 
 ## Rules it reads
@@ -34,7 +35,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 |---|---|
 | `.kicad_pro` net classes | clearance, track width, via diameter and drill, differential pair width, gap and via gap; assignments and wildcard patterns |
 | `.kicad_pro` board rules | minimum clearance, copper-to-edge clearance, hole clearance, hole-to-hole gap |
-| `.kicad_dru` constraints | `clearance`, `track_width` (`opt` sets the width, `min` is a floor, `max` a cap), `edge_clearance`, `disallow via`, `length` (tracks are lengthened to `min` or `opt`; over `max` is reported), `skew` (`max`, between the halves of a pair), `diff_pair_gap` (`opt`, else `min`) |
+| `.kicad_dru` constraints | `clearance`, `track_width` (`opt` sets the width, `min` is a floor, `max` a cap), `edge_clearance`, `disallow via` (every kind of via) and `disallow through_via`, `blind_via` or `buried_via` (that kind only), `length` (tracks are lengthened to `min` or `opt`; over `max` is reported), `skew` (`max`, between the halves of a pair), `diff_pair_gap` (`opt`, else `min`) |
 | `.kicad_dru` conditions | `A/B.NetName`, `A/B.NetClass`, `A/B.Type`, `A/B.Layer`, `==` and `!=` with wildcards, `&&`, `\|\|`, `!`, `hasNetclass()`, `existsOnLayer()`, `inDiffPair()`, `intersectsCourtyard()` and `insideCourtyard()` for pads |
 | `.kicad_dru` layer clause | `(layer "F.Cu")` (wildcards allowed), `(layer outer)`, `(layer inner)`: the rule holds on those layers only |
 
@@ -59,6 +60,10 @@ autorouter BOARD.kicad_pcb [options]
       --tracks-on-planes also lay tracks on inner layers that a pour covers (by default
                          such a layer is kept as a whole plane)
       --no-vias          route without vias
+      --via-spans A-B,.. blind and buried vias the board house can make, each as the two
+                         layers it joins: F.Cu-In1.Cu,In2.Cu-B.Cu (default: none; vias
+                         go right through the board)
+      --blind-vias       any blind or buried via: every pair of layers
       --via-in-pad       let vias sit on surface-mount pads of their own net
       --neck MM          width a track narrows to where it is too wide to reach a pad
                          (default: the Default class's width, or the rules' minimum if more)
@@ -123,6 +128,8 @@ The one unconnected item is a pour, not a track: on the battery board the new tr
 
 On the dispenser board with real widths, three pads of the 1.2 mm supply are reached by a narrowed piece, and 14 of the 19 vias on wide tracks got a second via; the other five had no room and are listed.
 
+Blind and buried vias were tried on the vehicle tracker, with tracks allowed on its two inner layers. With every span allowed, 194 of its 245 vias came out blind; with only neighbouring layers joined (`F.Cu-In1.Cu,In1.Cu-In2.Cu,In2.Cu-B.Cu`), 123 blind and 1 buried of 242. Both runs join all 187 nets and pass KiCad's DRC with no errors, no warnings and nothing unconnected.
+
 The mains board is the case per-pair rules are for. Routed whole, mains included, it needs 8 mm from mains to low voltage and 2.5 mm between mains nets at once, which one net-class clearance cannot say. That run also comes out with 0 errors and 0 unconnected.
 
 ## Limits
@@ -130,7 +137,7 @@ The mains board is the case per-pair rules are for. Routed whole, mains included
 - **A grid router.** Tracks run on a grid (0.25 mm by default) in 45-degree steps. There is no push-and-shove and no smoothing of the result.
 - **Lengths.** A net's length is the sum of its tracks (those the board had and the new ones); vias and the path inside pads are not counted, and a net of more than two pads is measured as a whole, not pad to pad. Length and skew rules are followed only where their condition holds for certain. Meanders are square-cornered. A pair's skew is made up with bumps on its shorter half wherever there is room, not necessarily next to the bend that caused it.
 - **Pad shapes.** Custom pad shapes are taken as their bounding box, and trapezoids as their enclosing rectangle. That is safe but can block more than it needs to.
-- **Through vias only.** No blind or buried vias, and no micro vias.
+- **Blind and buried vias are yours to name.** The router does not know how your board is built up, so it uses only the spans you give it; ask your board house which they make before you pass `--blind-vias`. A blind or buried via is the same size as the net's through via. There are no micro vias, and the router does not stack or stagger vias on purpose.
 - **Rules on the safe side.** A condition the router can't settle makes the rule apply everywhere. A rule that exempts an area, like a courtyard, is honoured for the pads in that area but not for tracks near them.
 - **Fine-pitch parts.** A narrowed piece is one straight line of up to `--neck-length`. A pad that even that cannot reach legally is left unjoined and reported, not forced. Fan such pads out by hand, lock those tracks, and the router carries on from their ends.
 - **Plated holes of other nets** are kept clear by their pad's copper, not by a hole rule of their own. Non-plated holes and slots keep the board's hole clearance.

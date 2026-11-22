@@ -27,6 +27,10 @@ usage: autorouter BOARD.kicad_pcb [options]
       --tracks-on-planes also lay tracks on inner layers that a pour covers (by default
                          such a layer is kept as a whole plane)
       --no-vias          route without vias
+      --via-spans A-B,.. blind and buried vias the board house can make, each as the two
+                         layers it joins: F.Cu-In1.Cu,In2.Cu-B.Cu (default: none; vias
+                         go right through the board)
+      --blind-vias       any blind or buried via: every pair of layers
       --via-in-pad       let vias sit on surface-mount pads of their own net
       --neck MM          width a track narrows to where it is too wide to reach a pad
                          (default: the Default class's width, or the rules' minimum if more)
@@ -190,6 +194,8 @@ fn main() {
         (None::<PathBuf>, None::<PathBuf>, false, false, false, false);
     let mut report: Option<PathBuf> = None;
     let mut layer_names: Option<Vec<String>> = None;
+    let mut span_names: Vec<String> = Vec::new();
+    let mut any_span = false;
     let mut i = 0;
     let value = |i: &mut usize, name: &str| -> String {
         *i += 1;
@@ -206,6 +212,8 @@ fn main() {
             "--include-poured" | "--include-zone-nets" => opt.include_poured = true,
             "--rip" => rip = true,
             "--layers" => layer_names = Some(list(&value(&mut i, &a))),
+            "--via-spans" => span_names.extend(list(&value(&mut i, &a))),
+            "--blind-vias" => any_span = true,
             "--grid" => opt.grid = mm(&value(&mut i, &a), &a),
             "--margin" => {
                 opt.margin = value(&mut i, &a)
@@ -307,6 +315,35 @@ fn main() {
             .collect();
         opt.layers = Some(idx);
     }
+    for name in &span_names {
+        let ends: Vec<usize> = name
+            .split('-')
+            .map(|n| {
+                board.copper.iter().position(|c| c == n.trim()).unwrap_or_else(|| {
+                    die(&format!(
+                        "--via-spans {}: no copper layer {} (the board has {})",
+                        name,
+                        n,
+                        board.copper.join(", ")
+                    ))
+                })
+            })
+            .collect();
+        if ends.len() != 2 || ends[0] == ends[1] {
+            die(&format!(
+                "--via-spans {}: a via is named by the two layers it joins, as in F.Cu-In1.Cu",
+                name
+            ));
+        }
+        opt.via_spans.push((ends[0].min(ends[1]), ends[0].max(ends[1])));
+    }
+    if any_span {
+        let nl = board.copper.len();
+        opt.via_spans = (0..nl).flat_map(|a| (a + 1..nl).map(move |b| (a, b))).collect();
+    }
+    if (any_span || !span_names.is_empty()) && board.copper.len() < 3 {
+        eprintln!("note: a board of two layers has no blind or buried vias: every via goes right through");
+    }
     let rules = Rules::for_board(&input, &board).unwrap_or_else(|e| die(&e));
     for n in &rules.notes {
         eprintln!("note: {}", n);
@@ -365,8 +402,19 @@ fn main() {
             eprintln!("  left alone: {} ({})", net, why);
         }
     }
+    let bottom = board.copper.len() - 1;
+    let blind = result
+        .vias
+        .iter()
+        .filter(|v| (v.layers.0 == 0) != (v.layers.1 == bottom))
+        .count();
+    let buried = result
+        .vias
+        .iter()
+        .filter(|v| v.layers.0 != 0 && v.layers.1 != bottom)
+        .count();
     println!(
-        "{}: {} of {} nets joined in {:.1} s ({} passes); {} tracks, {} vias added{}",
+        "{}: {} of {} nets joined in {:.1} s ({} passes); {} tracks, {} vias added{}{}",
         output.display(),
         result.nets.len() - left.len(),
         result.nets.len(),
@@ -374,6 +422,11 @@ fn main() {
         result.passes,
         result.tracks.len(),
         result.vias.len(),
+        if blind + buried > 0 {
+            format!(" ({} blind, {} buried)", blind, buried)
+        } else {
+            String::new()
+        },
         if rip {
             format!("; {} old items removed", removed)
         } else {
@@ -528,7 +581,7 @@ fn main() {
             .sum();
         let text = format!(
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
-             \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \
+             \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \"blind_vias\": {},\n  \"buried_vias\": {},\n  \
              \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
              \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
@@ -541,6 +594,8 @@ fn main() {
             result.tracks.len(),
             track_mm,
             result.vias.len(),
+            blind,
+            buried,
             result.doubled,
             result.single.len(),
             removed,

@@ -86,16 +86,25 @@ pub fn with_routes(board: &Board, routed: &Routed, remove: &[(usize, usize)]) ->
             id(&mut ids)
         ));
     }
-    let (first, last) = (board.copper[0].clone(), board.copper[board.copper.len() - 1].clone());
+    let bottom = board.copper.len() - 1;
     for v in &routed.vias {
+        // a via that stops short of an outer layer says so: blind with one end
+        // on the outside, buried with none (a word KiCad has had since version 10)
+        let (a, b) = (v.layers.0.min(bottom), v.layers.1.min(bottom));
+        let kind = match (a == 0, b == bottom) {
+            (true, true) => "",
+            (false, false) if board.version >= 20260101 => " buried",
+            _ => " blind",
+        };
         add.push_str(&format!(
-            "\t(via\n\t\t(at {} {})\n\t\t(size {})\n\t\t(drill {})\n\t\t(layers {} {})\n\t\t{}\n\t\t{}\n\t)\n",
+            "\t(via{}\n\t\t(at {} {})\n\t\t(size {})\n\t\t(drill {})\n\t\t(layers {} {})\n\t\t{}\n\t\t{}\n\t)\n",
+            kind,
             num(v.at.0),
             num(v.at.1),
             num(v.diameter),
             num(v.drill),
-            quote(&first),
-            quote(&last),
+            quote(&board.copper[a]),
+            quote(&board.copper[b]),
             net_token(board, &v.net),
             id(&mut ids)
         ));
@@ -158,6 +167,7 @@ mod tests {
             at: (1.0, 2.5),
             diameter: 0.6,
             drill: 0.3,
+            layers: (0, 1),
         });
         let spans: Vec<(usize, usize)> = b.tracks.iter().map(|t| t.span).collect();
         let out = with_routes(&b, &r, &spans);
@@ -180,5 +190,34 @@ mod tests {
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
         assert_ne!(u, ids.uuid());
+    }
+
+    #[test]
+    fn blind_and_buried_vias_are_written_as_such() {
+        let head = "(kicad_pcb (version VERSION) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user))\n(net 0 \"\") (net 1 \"A\")\n)";
+        let mut r = Routed::default();
+        for (k, layers) in [(0, 3), (0, 1), (1, 2), (2, 3)].into_iter().enumerate() {
+            r.vias.push(NewVia {
+                net: "A".into(),
+                at: (k as f64, 0.0),
+                diameter: 0.6,
+                drill: 0.3,
+                layers,
+            });
+        }
+        let b = Board::parse(head.replace("VERSION", "20260206")).unwrap();
+        let out = with_routes(&b, &r, &[]);
+        assert_eq!(out.matches("(via\n").count(), 1, "{}", out);
+        assert_eq!(out.matches("(via blind\n").count(), 2, "{}", out);
+        assert_eq!(out.matches("(via buried\n").count(), 1, "{}", out);
+        assert!(out.contains("(layers \"In1.Cu\" \"In2.Cu\")"));
+        let back = Board::parse(out).unwrap();
+        let spans: Vec<(usize, usize)> = back.vias.iter().map(|v| v.layers).collect();
+        assert_eq!(spans, vec![(0, 3), (0, 1), (1, 2), (2, 3)]);
+        // KiCad 9 and before have one word for both
+        let old = Board::parse(head.replace("VERSION", "20241229")).unwrap();
+        let out = with_routes(&old, &r, &[]);
+        assert_eq!(out.matches("(via blind\n").count(), 3, "{}", out);
+        assert!(!out.contains("buried"));
     }
 }

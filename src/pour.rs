@@ -92,7 +92,7 @@ fn copper(board: &Board, routed: Option<&Routed>) -> Vec<Copper> {
             c: v.at,
             r: v.diameter / 2.0,
         };
-        out.push((v.net.clone(), shape, all.clone()));
+        out.push((v.net.clone(), shape, (v.layers.0..=v.layers.1).collect()));
     }
     for &h in &board.holes {
         out.push((None, h, all.clone()));
@@ -111,7 +111,7 @@ fn copper(board: &Board, routed: Option<&Routed>) -> Vec<Copper> {
                 c: v.at,
                 r: v.diameter / 2.0,
             };
-            out.push((Some(v.net.clone()), shape, all.clone()));
+            out.push((Some(v.net.clone()), shape, (v.layers.0..=v.layers.1).collect()));
         }
     }
     out
@@ -183,8 +183,9 @@ fn pieces(board: &Board, rules: &Rules, net: &str, items: &[Copper], gr: &Grid) 
             gr.each(shape, (clr + thin / 2.0 - gr.g / 2.0).max(0.0), |c| layer[c] = 0);
         }
     }
-    // the net's own copper conducts wherever it is; through pads and vias join the layers
-    let mut joins: Vec<usize> = Vec::new();
+    // the net's own copper conducts wherever it is; through pads and vias join
+    // the layers they reach. up[l * n + c]: layer l is joined to the next one down at c
+    let mut up = vec![false; n * nl];
     for (onet, shape, layers) in items {
         if onet.as_deref() != Some(net) {
             continue;
@@ -194,13 +195,12 @@ fn pieces(board: &Board, rules: &Rules, net: &str, items: &[Copper], gr: &Grid) 
             gr.each(shape, 0.0, |c| layer[c] = 1);
             layer[gr.cell(shape.centre())] = 1;
         }
-        if layers.len() > 1 {
-            joins.push(gr.cell(shape.centre()));
+        if let (Some(&a), Some(&b)) = (layers.iter().min(), layers.iter().max()) {
+            let c = gr.cell(shape.centre());
+            for l in a..b {
+                up[l * n + c] = true;
+            }
         }
-    }
-    let mut join = vec![false; n];
-    for c in joins {
-        join[c] = true;
     }
     let mut label = vec![u32::MAX; n * nl];
     let mut sizes: Vec<u32> = Vec::new();
@@ -235,12 +235,16 @@ fn pieces(board: &Board, rules: &Rules, net: &str, items: &[Copper], gr: &Grid) 
             if j + 1 < gr.h {
                 go(s + gr.w);
             }
-            if join[c] {
-                for l2 in 0..nl {
-                    if l2 != l {
-                        go(l2 * n + c);
-                    }
-                }
+            // along the barrel, both ways, to every layer it reaches
+            let mut l2 = l;
+            while l2 + 1 < nl && up[l2 * n + c] {
+                l2 += 1;
+                go(l2 * n + c);
+            }
+            let mut l2 = l;
+            while l2 > 0 && up[(l2 - 1) * n + c] {
+                l2 -= 1;
+                go(l2 * n + c);
             }
         }
         sizes.push(size);

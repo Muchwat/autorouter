@@ -40,6 +40,9 @@ pub struct Via {
     pub at: P,
     pub diameter: f64,
     pub drill: f64,
+    /// The first and last copper layer it joins (indices into Board::copper):
+    /// all of them for a through via, fewer for a blind or buried one.
+    pub layers: (usize, usize),
     pub locked: bool,
     pub span: (usize, usize),
 }
@@ -253,8 +256,14 @@ impl Board {
                 }
                 Some("via") => {
                     if let Some(at) = item.get("at").and_then(xy) {
+                        let span = layer_list(item);
+                        let layers = match (span.first(), span.last()) {
+                            (Some(&a), Some(&z)) if a != z => (a, z),
+                            _ => (0, copper.len() - 1),
+                        };
                         b.vias.push(Via {
                             net: net_of(item),
+                            layers,
                             at,
                             diameter: item.child_num("size").unwrap_or(0.8),
                             drill: item.child_num("drill").unwrap_or(0.4),
@@ -660,6 +669,7 @@ mod tests {
         assert_eq!(b.tracks[0].net.as_deref(), Some("A"));
         assert_eq!(b.tracks[0].layer, 1);
         assert_eq!(b.vias[0].net.as_deref(), Some("B"));
+        assert_eq!(b.vias[0].layers, (0, 1));
         assert_eq!(b.poured_nets(), vec!["A".to_string()]);
         assert_eq!(b.edges.len(), 4);
         assert_eq!(b.extent(), Some((0.0, 0.0, 20.0, 20.0)));
@@ -697,6 +707,21 @@ mod tests {
         assert_eq!(b.edges[0].0, (0.0, 0.0));
         let last = b.edges[b.edges.len() - 1].1;
         assert!((last.0 - 20.0).abs() < 1e-9 && (last.1 - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reads_blind_and_buried_vias() {
+        let t = r#"(kicad_pcb (version 20260206)
+          (layers (0 "F.Cu" signal) (4 "In1.Cu" signal) (6 "In2.Cu" signal) (2 "B.Cu" signal))
+          (via (at 1 1) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net "A"))
+          (via blind (at 2 1) (size 0.6) (drill 0.3) (layers "F.Cu" "In1.Cu") (net "A"))
+          (via buried (at 3 1) (size 0.6) (drill 0.3) (layers "In1.Cu" "In2.Cu") (net "A"))
+          (via blind (at 4 1) (size 0.6) (drill 0.3) (layers "In2.Cu" "B.Cu") (net "A"))
+          (via micro locked (at 5 1) (size 0.3) (drill 0.1) (layers "F.Cu" "In1.Cu") (net "A")))"#;
+        let b = Board::parse(t.to_string()).unwrap();
+        let spans: Vec<(usize, usize)> = b.vias.iter().map(|v| v.layers).collect();
+        assert_eq!(spans, vec![(0, 3), (0, 1), (1, 2), (2, 3), (0, 1)]);
+        assert!(b.vias[4].locked && !b.vias[1].locked);
     }
 
     #[test]
