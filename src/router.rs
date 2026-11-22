@@ -276,6 +276,8 @@ struct Terminal {
 
 struct Job {
     net: String,
+    /// The track width on each copper layer, and the widest of them.
+    widths: Vec<f64>,
     width: f64,
     via: Option<(f64, f64)>,
     /// Extra gap on every clearance of this job: walls and conflicts are tested
@@ -308,9 +310,13 @@ struct PairSpec {
     job_p: usize,
     job_n: usize,
     net_n: String,
-    /// Width of each track and the gap between them.
+    /// Width of each track and the gap between them: on the first layer (for
+    /// reports), and on each layer.
     w: f64,
+    #[allow(dead_code)]
     gap: f64,
+    ws: Vec<f64>,
+    gaps: Vec<f64>,
     /// One via of the two (diameter, drill), their least pitch, and how far to
     /// its side of the path each must stand for the other track to pass it.
     via: Option<(f64, f64)>,
@@ -668,6 +674,9 @@ struct Router<'a> {
     work: Work,
     clr_cache: HashMap<(String, &'static str, Option<String>, &'static str, Option<u64>), f64>,
     cache_ok: bool,
+    /// (job, signature, via, layer) -> how far that job's track (on that layer)
+    /// or via must stay from a job of that signature's copper
+    radii: HashMap<(usize, usize, bool, usize), Option<f64>>,
     /// Jobs in play. The jobs that route a stretch of a pair one net at a time
     /// sleep unless the pair cannot be had there.
     active: Vec<bool>,
@@ -722,6 +731,14 @@ impl<'a> Router<'a> {
         !self.planes.contains(&l) && self.opt.layers.as_ref().map(|v| v.contains(&l)).unwrap_or(true)
     }
 
+    /// A copper layer as the rules see it.
+    fn layer(&self, l: usize) -> crate::rules::Layer<'a> {
+        crate::rules::Layer {
+            name: self.board.copper[l].as_str(),
+            outer: l == 0 || l + 1 == self.board.copper.len(),
+        }
+    }
+
     /// Walls for job j: (per-layer track walls, via walls).
     fn hard(&mut self, j: usize) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
         if let Some(h) = &self.hard[j] {
@@ -729,7 +746,10 @@ impl<'a> Router<'a> {
         }
         let (nl, n) = (self.gr.nl, self.gr.n);
         let net = self.jobs[j].net.clone();
+        // half the track's width, on each layer
+        let hws: Vec<f64> = self.jobs[j].widths.iter().map(|w| w / 2.0).collect();
         let hw = self.jobs[j].width / 2.0;
+        let layered = self.rules.layered();
         let vr = self.jobs[j].via.map(|v| v.0 / 2.0);
         let m = self.jobs[j].margin;
         let mut block: Vec<Vec<u8>> = (0..nl).map(|_| self.outside.clone()).collect();
@@ -744,7 +764,7 @@ impl<'a> Router<'a> {
             let s = Shape::Capsule { a, b, r: 0.0 };
             for l in 0..nl {
                 let bl = &mut block[l];
-                self.gr.each(&s, ec + hw + m, |c| bl[c] = 1);
+                self.gr.each(&s, ec + hws[l] + m, |c| bl[c] = 1);
             }
             if let (Some(vb), Some(vr)) = (vblock.as_mut(), vr) {
                 self.gr.each(&s, ec + vr + m, |c| vb[c] = 1);
@@ -774,9 +794,11 @@ impl<'a> Router<'a> {
                     } else {
                         geom::polygon_edge_dist(p, &z.outline)
                     };
-                    if k.tracks && d <= hw + m {
+                    if k.tracks {
                         for &l in &z.layers {
-                            block[l][c] = 1;
+                            if d <= hws[l] + m {
+                                block[l][c] = 1;
+                            }
                         }
                     }
                     if let (true, Some(vb), Some(vr)) = (k.vias, vblock.as_mut(), vr) {
@@ -790,6 +812,12 @@ impl<'a> Router<'a> {
         let mut owed = vec![0f32; self.obstacles.len()];
         // the rules are asked once for each group of like obstacles: (for a track, for a via)
         let mut asked: Vec<Option<(f64, f64)>> = vec![None; self.ngroups];
+        let mut asked_on: HashMap<(usize, usize), f64> = HashMap::new();
+        let me = if self.jobs[j].pair.is_some() {
+            Item::track(&net).in_pair()
+        } else {
+            Item::track(&net)
+        };
         // a pair keeps its coupled part off its own two nets' pads (they are reached
         // by a piece of track each, not by the pair as a whole)
         let pair = self.jobs[j].pair.as_ref().map(|p| (p.net_n.clone(), p.pn));
@@ -810,9 +838,11 @@ impl<'a> Router<'a> {
                         net: ob.net.as_deref(),
                         kind: Some(ob.kind),
                         shape: Some(&ob.shape),
+                        layer: None,
+                        paired: None,
                     };
                     let v = (
-                        self.rules.clearance(&Item::track(&net), &other),
+                        self.rules.clearance(&me, &other),
                         if vr.is_some() {
                             self.rules.clearance(&Item::via(&net), &other)
                         } else {
@@ -823,13 +853,36 @@ impl<'a> Router<'a> {
                     v
                 }
             };
-            let clr = ct.max(ob.least);
-            owed[o] = clr as f32;
-            let rt = clr + hw + m;
+            let mut most = ct.max(ob.least);
             for &l in &ob.layers {
+                // where a rule tells layers apart, the clearance is this layer's own
+                let clr = if layered && !(own && pair.is_some()) {
+                    let key = (ob.group, l);
+                    match asked_on.get(&key) {
+                        Some(v) => *v,
+                        None => {
+                            let layer = Some(self.layer(l));
+                            let other = Item {
+                                net: ob.net.as_deref(),
+                                kind: Some(ob.kind),
+                                shape: Some(&ob.shape),
+                                layer,
+                                paired: None,
+                            };
+                            let v = self.rules.clearance(&me.on(layer), &other);
+                            asked_on.insert(key, v);
+                            v
+                        }
+                    }
+                    .max(ob.least)
+                } else {
+                    ct.max(ob.least)
+                };
+                most = most.max(clr);
                 let bl = &mut block[l];
-                self.gr.each(&ob.shape, rt, |c| bl[c] = 1);
+                self.gr.each(&ob.shape, clr + hws[l] + m, |c| bl[c] = 1);
             }
+            owed[o] = most as f32;
             if let (Some(vr), Some(vb)) = (vr, vblock.as_mut()) {
                 self.gr.each(&ob.shape, cv.max(ob.least) + vr + m, |c| vb[c] = 1);
             }
@@ -987,8 +1040,8 @@ impl<'a> Router<'a> {
         let (n, g) = (self.gr.n, self.gr.g);
         let (block, _) = self.hard(j);
         let net = self.jobs[j].net.clone();
-        let (width, neck) = (self.jobs[j].width, self.jobs[j].neck);
-        let hw = width / 2.0;
+        let (widths, neck) = (self.jobs[j].widths.clone(), self.jobs[j].neck);
+        let hw = self.jobs[j].width / 2.0; // (the widest, for how far to look)
         let edge = self.rules.edge_clearance(&net);
         let beside = 1.5 * g;
         let neck_len = if neck.is_some() { self.opt.neck_length } else { 0.0 };
@@ -1012,8 +1065,8 @@ impl<'a> Router<'a> {
                     }
                 });
                 for c in cells {
-                    if self.stub_ok(hw, self.gr.xy(c), end, l, &near, edge) {
-                        st.push(((l * n + c) as u32, Some((end, width))));
+                    if self.stub_ok(widths[l] / 2.0, self.gr.xy(c), end, l, &near, edge) {
+                        st.push(((l * n + c) as u32, Some((end, widths[l]))));
                     }
                 }
             }
@@ -1055,8 +1108,8 @@ impl<'a> Router<'a> {
                             }
                         });
                         for c in cells {
-                            if self.stub_ok(hw, self.gr.xy(c), centre, l, &near, edge) {
-                                st.push(((l * n + c) as u32, Some((centre, width))));
+                            if self.stub_ok(widths[l] / 2.0, self.gr.xy(c), centre, l, &near, edge) {
+                                st.push(((l * n + c) as u32, Some((centre, widths[l]))));
                             }
                         }
                         if open(&st) {
@@ -1068,7 +1121,7 @@ impl<'a> Router<'a> {
                     }
                     // too wide to get there, or only into a pocket: the nearest cells with
                     // room around them that a narrower piece reaches from
-                    if let Some(nw) = neck {
+                    if let Some(nw) = neck.filter(|nw| *nw < widths[l] - 1e-9) {
                         let mut cells: Vec<(f64, usize)> = Vec::new();
                         let bl = &block[l];
                         self.gr.each(shape, neck_len, |c| {
@@ -1102,7 +1155,18 @@ impl<'a> Router<'a> {
     }
 
     /// Radius around a job of signature `sig` that keeps job j's tracks (via=false) or vias out.
-    fn radius(&mut self, j: usize, sig: usize, via: bool) -> Option<f64> {
+    fn radius(&mut self, j: usize, sig: usize, via: bool, layer: usize) -> Option<f64> {
+        // (a via is the same on every layer)
+        let key = (j, sig, via, if via { 0 } else { layer });
+        if let Some(r) = self.radii.get(&key) {
+            return *r;
+        }
+        let r = self.radius_of(j, sig, via, layer);
+        self.radii.insert(key, r);
+        r
+    }
+
+    fn radius_of(&mut self, j: usize, sig: usize, via: bool, layer: usize) -> Option<f64> {
         let rep = self
             .jobs
             .iter()
@@ -1110,10 +1174,18 @@ impl<'a> Router<'a> {
             .find(|(k, jb)| *k != j && jb.sig == sig)
             .map(|(_, jb)| jb.net.clone())?;
         let net = self.jobs[j].net.clone();
-        let me = if via { Item::via(&net) } else { Item::track(&net) };
-        let mut c = self
-            .clearance(me, Item::track(&rep))
-            .max(self.clearance(me, Item::via(&rep)));
+        let mut c = if via || !self.rules.layered() {
+            let me = if via { Item::via(&net) } else { Item::track(&net) };
+            self.clearance(me, Item::track(&rep))
+                .max(self.clearance(me, Item::via(&rep)))
+        } else {
+            // a rule tells layers apart: this layer's own clearance
+            let on = Some(self.layer(layer));
+            let me = Item::track(&net).on(on);
+            self.rules
+                .clearance(&me, &Item::track(&rep).on(on))
+                .max(self.rules.clearance(&me, &Item::via(&rep).on(on)))
+        };
         if via {
             // two vias: their holes keep the board's hole-to-hole gap as well
             let other = self.jobs.iter().find(|jb| jb.net == rep).and_then(|jb| jb.via);
@@ -1124,7 +1196,7 @@ impl<'a> Router<'a> {
         let half = if via {
             self.jobs[j].via?.0 / 2.0
         } else {
-            self.jobs[j].width / 2.0
+            self.jobs[j].widths[layer] / 2.0
         };
         Some(c + half + self.jobs[j].margin)
     }
@@ -1285,16 +1357,15 @@ impl<'a> Router<'a> {
         let mut soft: Vec<Vec<u16>> = vec![vec![0u16; n]; nl];
         let mut sv: Vec<u32> = vec![0u32; n];
         for sig in self.signatures() {
-            if let Some(rt) = self.radius(j, sig, false) {
-                let key = self.occupancy(sig, rt);
-                let arr = &self.occ[&key];
-                for l in 0..nl {
-                    for (d, s) in soft[l].iter_mut().zip(arr[l].iter()) {
+            for l in 0..nl {
+                if let Some(rt) = self.radius(j, sig, false, l) {
+                    let key = self.occupancy(sig, rt);
+                    for (d, s) in soft[l].iter_mut().zip(self.occ[&key][l].iter()) {
                         *d += *s as u16;
                     }
                 }
             }
-            if let Some(rv) = self.radius(j, sig, true) {
+            if let Some(rv) = self.radius(j, sig, true, 0) {
                 let key = self.occupancy(sig, rv);
                 let arr = &self.occ[&key];
                 for l in 0..nl {
@@ -1307,15 +1378,14 @@ impl<'a> Router<'a> {
         if self.laid[j].is_some() {
             // job j's own copper is in its signature's pile: take it out again
             let sig = self.jobs[j].sig;
-            if let Some(rt) = self.radius(j, sig, false) {
-                let c = self.contribution(j, rt);
-                for l in 0..nl {
-                    for &cell in &c[l] {
+            for l in 0..nl {
+                if let Some(rt) = self.radius(j, sig, false, l) {
+                    for &cell in &self.contribution(j, rt)[l] {
                         soft[l][cell as usize] = soft[l][cell as usize].saturating_sub(1);
                     }
                 }
             }
-            if let Some(rv) = self.radius(j, sig, true) {
+            if let Some(rv) = self.radius(j, sig, true, 0) {
                 let c = self.contribution(j, rv);
                 for l in 0..nl {
                     for &cell in &c[l] {
@@ -1330,15 +1400,14 @@ impl<'a> Router<'a> {
                 continue;
             }
             let sig = self.jobs[k].sig;
-            if let Some(rt) = self.radius(j, sig, false) {
-                let c = self.own_in_sibling(j, k, rt);
-                for l in 0..nl {
-                    for &cell in &c[l] {
+            for l in 0..nl {
+                if let Some(rt) = self.radius(j, sig, false, l) {
+                    for &cell in &self.own_in_sibling(j, k, rt)[l] {
                         soft[l][cell as usize] = soft[l][cell as usize].saturating_sub(1);
                     }
                 }
             }
-            if let Some(rv) = self.radius(j, sig, true) {
+            if let Some(rv) = self.radius(j, sig, true, 0) {
                 let c = self.own_in_sibling(j, k, rv);
                 for l in 0..nl {
                     for &cell in &c[l] {
@@ -1437,15 +1506,20 @@ impl<'a> Router<'a> {
             (Some(s), true) => s.net_n.clone(),
             _ => self.jobs[j].net.clone(),
         };
-        let width = spec.as_ref().map(|s| s.w).unwrap_or(self.jobs[j].width);
-        // a pair is checked as the one wide track it was routed as: about its middle
-        let shift = spec.as_ref().map(|s| (s.w + s.gap) / 2.0).unwrap_or(0.0);
-        let pn = spec.as_ref().map(|s| s.pn).unwrap_or(0.0);
-        let apart = width + width.max(self.rules.class_of(&net).clearance);
-        let m = tune::Meander {
-            spacing: apart,
-            amplitude: self.opt.meander,
+        // the track's width on each layer; and a pair is checked as the one wide
+        // track it was routed as, about its middle: how far that is, on each layer
+        let nl = self.gr.nl;
+        let widths: Vec<f64> = match &spec {
+            Some(s) => s.ws.clone(),
+            None => self.jobs[j].widths.clone(),
         };
+        let shifts: Vec<f64> = match &spec {
+            Some(s) => (0..nl).map(|l| (s.ws[l] + s.gaps[l]) / 2.0).collect(),
+            None => vec![0.0; nl],
+        };
+        let pn = spec.as_ref().map(|s| s.pn).unwrap_or(0.0);
+        let own_clearance = self.rules.class_of(&net).clearance;
+        let tallest = self.opt.meander;
         // the rest of this net's copper, and the other half's, here and in the other
         // stretches of the pair: (layer, a, b, width)
         let mut own: Vec<(usize, P, P, f64)> = Vec::new();
@@ -1504,9 +1578,15 @@ impl<'a> Router<'a> {
             } else {
                 laid.tracks[i].clone()
             };
+            let (width, shift) = (widths[l], shifts[l]);
             if (w - width).abs() > 1e-9 {
                 continue; // a narrowed piece into a pad
             }
+            let apart = width + width.max(own_clearance);
+            let m = tune::Meander {
+                spacing: apart,
+                amplitude: tallest,
+            };
             let mut ok = |b: &tune::Bump| -> bool {
                 let out = {
                     let d = geom::dist(b[0], b[1]);
@@ -1603,7 +1683,7 @@ impl<'a> Router<'a> {
             _ => return (0, Vec::new()),
         };
         let (nl, g, w) = (self.gr.nl, self.gr.g, self.gr.w as i64);
-        let width = self.jobs[j].width;
+        let widths = self.jobs[j].widths.clone();
         let (block, vblock) = self.hard(j);
         let vblock = match vblock {
             Some(v) => v,
@@ -1664,7 +1744,7 @@ impl<'a> Router<'a> {
                     continue;
                 }
                 for &l in &layers {
-                    new_tracks.push((l, vec![p, p2], width));
+                    new_tracks.push((l, vec![p, p2], widths[l]));
                 }
                 new_vias.push(p2);
                 holes.push(p2);
@@ -1720,11 +1800,17 @@ impl<'a> Router<'a> {
                 continue; // all of it is this job's own net
             }
             let mut hit = false;
-            for (via, bit) in [(false, 1u8), (true, 2u8)] {
+            // (a track against the other's copper layer by layer, each at its own
+            // width there; a via against all of it)
+            let tries: Vec<(bool, u8, Option<usize>)> = (0..nl)
+                .map(|l| (false, 1u8, Some(l)))
+                .chain(std::iter::once((true, 2u8, None)))
+                .collect();
+            for (via, bit, only) in tries {
                 if hit {
                     break;
                 }
-                if let Some(r) = self.radius(j, sig, via) {
+                if let Some(r) = self.radius(j, sig, via, only.unwrap_or(0)) {
                     let c = match (sibling, self.shared_with(j, k)) {
                         (true, Some((_, others))) => {
                             let mut both = self.contribution_of(k, r, others[0]);
@@ -1735,10 +1821,10 @@ impl<'a> Router<'a> {
                         }
                         _ => self.contribution(k, r),
                     };
-                    hit = c
-                        .iter()
-                        .enumerate()
-                        .any(|(l, cells)| cells.iter().any(|&cell| mine[l * n + cell as usize] & bit != 0));
+                    hit = c.iter().enumerate().any(|(l, cells)| {
+                        only.map(|o| o == l).unwrap_or(true)
+                            && cells.iter().any(|&cell| mine[l * n + cell as usize] & bit != 0)
+                    });
                 }
             }
             if hit {
@@ -1767,10 +1853,10 @@ impl<'a> Router<'a> {
     ) -> Result<(), String> {
         let net_p = self.jobs[j].net.as_str();
         let edge = self.rules.edge_clearance(net_p);
-        let hw = spec.w / 2.0;
         let vr = spec.via.map(|v| v.0 / 2.0).unwrap_or(0.0);
         for (lines, vias, other_net) in [(&leg.a, &leg.vias_a, spec.net_n.as_str()), (&leg.b, &leg.vias_b, net_p)] {
             for (l, pts) in lines.iter() {
+                let hw = spec.ws[*l] / 2.0;
                 for s in pts.windows(2) {
                     if !self.stub_ok(hw + slack, s[0], s[1], *l, near, edge) {
                         return Err("its tracks would come too close to other copper at a corner or an end".into());
@@ -1798,8 +1884,17 @@ impl<'a> Router<'a> {
                 }
             }
         }
-        if pair::spacing(leg) < spec.w + spec.pn - 1e-6 {
-            return Err("its two tracks would come too close to each other at an end or a via".into());
+        for (la, pa) in &leg.a {
+            for (lb, pb) in leg.b.iter().filter(|(lb, _)| lb == la) {
+                let _ = lb;
+                for s in pa.windows(2) {
+                    for t in pb.windows(2) {
+                        if geom::seg_seg_dist(s[0], s[1], t[0], t[1]) < spec.ws[*la] + spec.pn - 1e-6 {
+                            return Err("its two tracks would come too close to each other at an end or a via".into());
+                        }
+                    }
+                }
+            }
         }
         // the other stretches of this pair: the corridor may share their space, so
         // each track is held off the other net's copper there, exactly
@@ -1817,6 +1912,7 @@ impl<'a> Router<'a> {
                         continue;
                     }
                     for (l, pts) in lines.iter() {
+                        let hw = spec.ws[*l] / 2.0;
                         for s in pts.windows(2) {
                             for (tl, tp, tw) in tracks.iter() {
                                 if tl != l {
@@ -1835,7 +1931,8 @@ impl<'a> Router<'a> {
         }
         for (vias, lines) in [(&leg.vias_a, &leg.b), (&leg.vias_b, &leg.a)] {
             for &v in vias.iter() {
-                for (_, pts) in lines.iter() {
+                for (l, pts) in lines.iter() {
+                    let hw = spec.ws[*l] / 2.0;
                     for s in pts.windows(2) {
                         if geom::seg_dist(v, s[0], s[1]) < vr + hw + spec.pn - 1e-6 {
                             return Err("a via would come too close to the other track".into());
@@ -1857,14 +1954,21 @@ impl<'a> Router<'a> {
         let n = self.gr.n;
         let spec = self.jobs[j].pair.clone().expect("a pair job");
         let (block, _) = self.hard(j);
-        let half = (spec.w + spec.gap) / 2.0;
+        let nl = self.gr.nl;
+        let halves: Vec<f64> = (0..nl).map(|l| (spec.ws[l] + spec.gaps[l]) / 2.0).collect();
+        let widest = halves.iter().cloned().fold(0.0, f64::max) * 2.0;
+        let widest_track = spec.ws.iter().cloned().fold(0.0, f64::max);
         let mut all: Vec<Vec<Entry2>> = Vec::new();
         for e in &spec.ends {
             let mid = ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
             let apart = geom::dist(e.p, e.n);
-            let rmin = (0.5 * apart).max(1.5 * (spec.w + spec.gap));
+            let rmin = (0.5 * apart).max(1.5 * widest);
             let rmax = rmin + apart.max(3.0);
-            let near = self.near(j, (mid.0 - rmax, mid.1 - rmax, mid.0 + rmax, mid.1 + rmax), spec.w);
+            let near = self.near(
+                j,
+                (mid.0 - rmax, mid.1 - rmax, mid.0 + rmax, mid.1 + rmax),
+                widest_track,
+            );
             let mut cells: Vec<usize> = Vec::new();
             self.gr.each(&Shape::Circle { c: mid, r: 0.0 }, rmax, |c| cells.push(c));
             let mut st: Vec<Entry2> = Vec::new();
@@ -1876,20 +1980,21 @@ impl<'a> Router<'a> {
                 }
                 // the two tracks arrive side by side, across the line from the pads
                 let side = (-(at.1 - mid.1) / d, (at.0 - mid.0) / d);
-                let (q1, q2) = (
-                    (at.0 + half * side.0, at.1 + half * side.1),
-                    (at.0 - half * side.0, at.1 - half * side.1),
-                );
-                let (qp, qn) = if geom::dist(e.p, q1) + geom::dist(e.n, q2) <= geom::dist(e.p, q2) + geom::dist(e.n, q1)
-                {
-                    (q1, q2)
-                } else {
-                    (q2, q1)
-                };
                 for &l in &e.layers {
                     if !self.layers_ok(l) || block[l][c] != 0 {
                         continue;
                     }
+                    let half = halves[l];
+                    let (q1, q2) = (
+                        (at.0 + half * side.0, at.1 + half * side.1),
+                        (at.0 - half * side.0, at.1 - half * side.1),
+                    );
+                    let (qp, qn) =
+                        if geom::dist(e.p, q1) + geom::dist(e.n, q2) <= geom::dist(e.p, q2) + geom::dist(e.n, q1) {
+                            (q1, q2)
+                        } else {
+                            (q2, q1)
+                        };
                     let try_ = pair::Leg {
                         a: vec![(l, vec![e.p, qp])],
                         b: vec![(l, vec![e.n, qn])],
@@ -1945,7 +2050,9 @@ impl<'a> Router<'a> {
                     .collect()
             })
             .collect();
-        let (half, via_half) = ((spec.w + spec.gap) / 2.0, spec.via_pitch / 2.0);
+        let halves: Vec<f64> = (0..nl).map(|l| (spec.ws[l] + spec.gaps[l]) / 2.0).collect();
+        let via_half = spec.via_pitch / 2.0;
+        let reach = spec.ws.iter().cloned().fold(0.0, f64::max) + halves.iter().cloned().fold(0.0, f64::max);
         let mut laid = Laid::default();
         let search_via = if vblock.is_some() { via_cost } else { 0.0 };
         let hist = std::mem::take(&mut self.hist);
@@ -2003,7 +2110,7 @@ impl<'a> Router<'a> {
                         {
                             bbox = (bbox.0.min(q.0), bbox.1.min(q.1), bbox.2.max(q.0), bbox.3.max(q.1));
                         }
-                        let near = self.near(j, bbox, spec.via_pitch + spec.w + half);
+                        let near = self.near(j, bbox, spec.via_pitch + reach);
                         // the pair faces straight out from its first pads and straight in to its last
                         let mid_of = |e: &PairEnd| ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
                         let (g0, g1) = (
@@ -2027,7 +2134,7 @@ impl<'a> Router<'a> {
                             for first in [1.0, -1.0] {
                                 match pair::leg(
                                     &runs,
-                                    half,
+                                    &halves,
                                     via_half,
                                     spec.via_side,
                                     first,
@@ -2053,8 +2160,10 @@ impl<'a> Router<'a> {
                         match leg {
                             None => stopped = Some(why),
                             Some(l) => {
-                                laid.tracks.extend(l.a.iter().map(|(ly, p)| (*ly, p.clone(), spec.w)));
-                                laid.tracks_n.extend(l.b.iter().map(|(ly, p)| (*ly, p.clone(), spec.w)));
+                                laid.tracks
+                                    .extend(l.a.iter().map(|(ly, p)| (*ly, p.clone(), spec.ws[*ly])));
+                                laid.tracks_n
+                                    .extend(l.b.iter().map(|(ly, p)| (*ly, p.clone(), spec.ws[*ly])));
                                 laid.real_vias.extend(l.vias_a.iter().map(|&v| (v, false)));
                                 laid.real_vias.extend(l.vias_b.iter().map(|&v| (v, true)));
                                 laid.vias.extend(l.centres.iter().cloned());
@@ -2161,7 +2270,7 @@ impl<'a> Router<'a> {
                 tree_pad.insert(e.0, (c, false));
             }
         }
-        let width = self.jobs[j].width;
+        let widths = self.jobs[j].widths.clone();
         let first_label = self.jobs[j].terminals[first].label.clone();
         let mut near: Vec<f64> = (0..terms).map(|t| geom::dist(centre(t), centre(first))).collect();
         let mut laid = Laid::default();
@@ -2172,8 +2281,10 @@ impl<'a> Router<'a> {
             let next = todo.remove(0);
             let label = self.jobs[j].terminals[next].label.clone();
             if states[next].is_empty() {
-                laid.unrouted
-                    .push(format!("{}: no clear way in for a {} mm track", label, width));
+                laid.unrouted.push(format!(
+                    "{}: no clear way in for a {} mm track",
+                    label, self.jobs[j].width
+                ));
                 continue;
             }
             let s = Search {
@@ -2233,14 +2344,14 @@ impl<'a> Router<'a> {
                             v.1 = true;
                         }
                     }
-                    for (end, name) in [(from, &first_label), (to, &label)] {
+                    for (end, name, at) in [(from, &first_label, path[0]), (to, &label, last)] {
                         if let Some((_, w)) = end {
-                            if w < width - 1e-9 && !laid.necked.iter().any(|(n, _)| n == name) {
+                            if w < widths[at as usize / n] - 1e-9 && !laid.necked.iter().any(|(n, _)| n == name) {
                                 laid.necked.push((name.clone(), w));
                             }
                         }
                     }
-                    self.geometry(&path, width, from, to, &mut laid);
+                    self.geometry(&path, &widths, from, to, &mut laid);
                     laid.paths.push(path);
                 }
             }
@@ -2254,7 +2365,7 @@ impl<'a> Router<'a> {
     /// Turn a path of states into tracks and vias. `from` and `to` are the
     /// points to start and finish on (a pad's centre, a track's loose end) and
     /// the width of that piece, when the path's ends call for them.
-    fn geometry(&self, path: &[u32], width: f64, from: Option<(P, f64)>, to: Option<(P, f64)>, laid: &mut Laid) {
+    fn geometry(&self, path: &[u32], widths: &[f64], from: Option<(P, f64)>, to: Option<(P, f64)>, laid: &mut Laid) {
         let n = self.gr.n;
         let mut runs: Vec<(usize, Vec<P>)> = Vec::new();
         for (k, &s) in path.iter().enumerate() {
@@ -2277,7 +2388,7 @@ impl<'a> Router<'a> {
             if let Some((pc, w)) = end {
                 let (l, pts) = &mut runs[if at_start { 0 } else { last }];
                 let cell = if at_start { pts[0] } else { pts[pts.len() - 1] };
-                if w < width - 1e-9 {
+                if w < widths[*l] - 1e-9 {
                     if geom::dist(cell, pc) > 1e-6 {
                         laid.tracks.push((*l, vec![cell, pc], w));
                     }
@@ -2305,7 +2416,7 @@ impl<'a> Router<'a> {
                 simp.push(p);
             }
             if simp.len() >= 2 {
-                laid.tracks.push((l, simp, width));
+                laid.tracks.push((l, simp, widths[l]));
             }
         }
     }
@@ -2544,6 +2655,10 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             }
         }
     }
+    let layer_of = |l: usize| crate::rules::Layer {
+        name: board.copper[l].as_str(),
+        outer: l == 0 || l + 1 == nl,
+    };
     let mut jobs: Vec<Job> = Vec::new();
     let mut sigs: Vec<String> = Vec::new();
     let smallest = rules.smallest_clearance();
@@ -2618,7 +2733,15 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         if terminals.len() < 2 {
             continue; // already joined
         }
-        let width = opt.track_width.unwrap_or_else(|| rules.track_width(&net));
+        // (a rule may give a net one width on outer layers and another on inner ones)
+        let widths: Vec<f64> = (0..nl)
+            .map(|l| {
+                opt.track_width
+                    .unwrap_or_else(|| rules.track_width_on(&net, layer_of(l)))
+            })
+            .collect();
+        let width = widths.iter().cloned().fold(0.0, f64::max);
+        let narrowest = widths.iter().cloned().fold(f64::INFINITY, f64::min);
         let via = if opt.no_vias {
             None
         } else {
@@ -2639,7 +2762,7 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             sx1 = sx1.max(t.centre.0);
             sy1 = sy1.max(t.centre.1);
         }
-        let margin = opt.margin.max(grid_margin(width / 2.0 + smallest, g));
+        let margin = opt.margin.max(grid_margin(narrowest / 2.0 + smallest, g));
         let neck = opt
             .neck
             .unwrap_or(rules.classes[0].track_width)
@@ -2651,6 +2774,7 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         };
         jobs.push(Job {
             net,
+            widths,
             width,
             via,
             margin,
@@ -2711,32 +2835,49 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             let class = rules.class_of(&jobs[i].net);
             let (ip, inn) = (Item::track(&jobs[i].net), Item::track(&other));
             let between = rules.clearance(&ip, &inn);
-            let w = opt.pair_width.unwrap_or(if class.pair_width > 0.0 {
-                class.pair_width
-            } else {
-                jobs[i].width
-            });
-            let gap = opt
-                .pair_gap
-                .unwrap_or(if class.pair_gap > 0.0 { class.pair_gap } else { between });
+            // the pair's track width and gap on each layer: an option, a rule for that
+            // layer, the class's pair settings, or the net's own width and clearance
+            let ws: Vec<f64> = (0..nl)
+                .map(|l| match (opt.pair_width, opt.track_width, class.pair_width > 0.0) {
+                    (Some(w), _, _) => w,
+                    (None, Some(w), false) => w,
+                    _ => rules.pair_width_on(&jobs[i].net, layer_of(l)),
+                })
+                .collect();
+            let gaps: Vec<f64> = (0..nl)
+                .map(|l| {
+                    opt.pair_gap
+                        .unwrap_or_else(|| rules.pair_gap_on(&jobs[i].net, layer_of(l)).unwrap_or(between))
+                })
+                .collect();
+            let (w, gap) = (ws[0], gaps[0]);
             let via = jobs[i].via;
+            let widest_gap = gaps.iter().cloned().fold(0.0, f64::max);
             let via_gap = if class.pair_via_gap > 0.0 {
                 class.pair_via_gap
             } else {
-                gap.max(between)
+                widest_gap.max(between)
             };
             let via_pitch = via
                 .map(|(d, h)| (d + via_gap).max(h + rules.hole_to_hole))
                 .unwrap_or(0.0);
-            let pn = gap.min(between);
+            let pn = gaps.iter().cloned().fold(between, f64::min);
             // a via stands at least this far to its side of the path, so the other
             // track (half a pitch to the other side) clears it; on a right-angle bend
             // that takes vias 1.41 times as far apart, which is what room is kept for
             let via_side = via
-                .map(|(d, _)| d / 2.0 + w / 2.0 + pn - (w + gap) / 2.0)
+                .map(|(d, _)| {
+                    (0..nl)
+                        .map(|l| d / 2.0 + ws[l] / 2.0 + pn - (ws[l] + gaps[l]) / 2.0)
+                        .fold(0.0, f64::max)
+                })
                 .unwrap_or(0.0);
             let via_room = via_pitch.max(2.0 * via_side * SQRT2);
-            let width = 2.0 * w + gap;
+            // as one wide track: both tracks and their gap, on each layer
+            let fat: Vec<f64> = (0..nl).map(|l| 2.0 * ws[l] + gaps[l]).collect();
+            let width = fat.iter().cloned().fold(0.0, f64::max);
+            let narrowest = fat.iter().cloned().fold(f64::INFINITY, f64::min);
+            let widest_half = (0..nl).map(|l| (ws[l] + gaps[l]) / 2.0).fold(0.0, f64::max);
             pair_legs.push((jobs[i].net.clone(), other.clone(), ends.len() - 1, w, gap));
             for leg in ends.windows(2) {
                 // the stretch one net at a time: two jobs of two pieces each
@@ -2746,6 +2887,7 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                         + (terminals[0].centre.1 - terminals[1].centre.1).abs();
                     let job = Job {
                         net: jobs[of].net.clone(),
+                        widths: jobs[of].widths.clone(),
                         width: jobs[of].width,
                         via: jobs[of].via,
                         margin: jobs[of].margin,
@@ -2781,12 +2923,13 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                 let (net, sig) = (jobs[i].net.clone(), jobs[i].sig);
                 jobs.push(Job {
                     net,
+                    widths: fat.clone(),
                     width,
                     // both vias as one: a disc that holds them whichever way the pair is heading
                     via: via.map(|(d, h)| (via_room + d, h)),
                     // (and room for the outer track's corners: mitred at a right angle
                     // they stand a little outside the width the path was found for)
-                    margin: opt.margin.max(grid_margin(width / 2.0 + smallest, g)) + (SQRT2 - 1.0) * (w + gap) / 2.0,
+                    margin: opt.margin.max(grid_margin(narrowest / 2.0 + smallest, g)) + (SQRT2 - 1.0) * widest_half,
                     neck: None,
                     terminals,
                     sig,
@@ -2797,6 +2940,8 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                         net_n: other.clone(),
                         w,
                         gap,
+                        ws: ws.clone(),
+                        gaps: gaps.clone(),
                         via,
                         via_pitch,
                         via_side,
@@ -2875,6 +3020,7 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         hist: vec![vec![0f32; gr.n]; nl],
         work: Work::new(gr.n * nl),
         clr_cache: HashMap::new(),
+        radii: HashMap::new(),
         cache_ok,
         log: Vec::new(),
         jobs,
@@ -3411,11 +3557,18 @@ mod tests {
 
     /// The smallest gap between copper of two different nets on one layer.
     fn smallest_gap(b: &Board, r: &Routed) -> f64 {
-        let c = copper(b, r);
+        (0..b.copper.len())
+            .map(|l| smallest_gap_on(b, r, l))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// The same, on one given layer.
+    fn smallest_gap_on(b: &Board, r: &Routed, layer: usize) -> f64 {
+        let c: Vec<(String, usize, Shape)> = copper(b, r).into_iter().filter(|x| x.1 == layer).collect();
         let mut worst = f64::INFINITY;
         for i in 0..c.len() {
             for k in i + 1..c.len() {
-                if c[i].0 != c[k].0 && c[i].1 == c[k].1 {
+                if c[i].0 != c[k].0 {
                     worst = worst.min(gap(&c[i].2, &c[k].2));
                 }
             }
@@ -4039,6 +4192,118 @@ mod tests {
         let l = &r.lengths[0];
         assert!((l.target - 40.0).abs() < 1e-9 && l.after < l.target, "{:?}", l);
         assert!(smallest_gap(&b, &r) >= 0.2 - 1e-6);
+    }
+
+    #[test]
+    fn a_net_has_its_own_width_on_each_layer() {
+        // the crossing nets change layer; a rule makes them wide on the front, narrow on the back
+        let b = crossing();
+        let mut rules = rules();
+        rules
+            .read_dru(
+                "(rule \"front\" (layer \"F.Cu\") (constraint track_width (opt 0.5mm)))\n\
+                 (rule \"back\" (layer \"B.Cu\") (constraint track_width (opt 0.2mm)))",
+            )
+            .unwrap();
+        let r = route(&b, &rules, &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(r.tracks.iter().any(|t| t.layer == 0) && r.tracks.iter().any(|t| t.layer == 1));
+        for t in &r.tracks {
+            let want = if t.layer == 0 { 0.5 } else { 0.2 };
+            assert!(
+                (t.width - want).abs() < 1e-9,
+                "a {} mm track on layer {}",
+                t.width,
+                t.layer
+            );
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        for net in ["H1", "H2", "V1", "V2"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+    }
+
+    #[test]
+    fn a_clearance_rule_for_one_layer_holds_there_only() {
+        let b = crossing();
+        let mut rules = rules();
+        rules
+            .read_dru("(rule \"back\" (layer \"B.Cu\") (constraint clearance (min 0.6mm)))")
+            .unwrap();
+        let r = route(&b, &rules, &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(
+            r.tracks.iter().any(|t| t.layer == 1),
+            "nothing went to the back to test"
+        );
+        assert!(
+            smallest_gap_on(&b, &r, 1) >= 0.6 - 1e-6,
+            "back copper {:.3} mm apart",
+            smallest_gap_on(&b, &r, 1)
+        );
+        assert!(smallest_gap_on(&b, &r, 0) >= 0.2 - 1e-6);
+        // and without the rule the back is as tight as the front is allowed to be
+        let plain = route(&b, &self::rules(), &Options::default());
+        assert!(smallest_gap_on(&b, &plain, 1) >= 0.2 - 1e-6);
+    }
+
+    #[test]
+    fn a_pair_has_its_own_width_and_gap_on_each_layer() {
+        // the pair has to go under a track that crosses the front
+        let wall = smd("W1", "WALL", 15.0, 1.0, 0.8, 0.8)
+            + &smd("W2", "WALL", 15.0, 19.0, 0.8, 0.8)
+            + "(segment (start 15 1) (end 15 19) (width 0.25) (layer \"F.Cu\") (net \"WALL\"))\n";
+        let b = pair_board(&wall);
+        let mut rules = rules();
+        rules
+            .read_dru(
+                "(rule \"pair front\" (layer \"F.Cu\") (constraint track_width (opt 0.3mm)) (constraint diff_pair_gap (opt 0.2mm)) (condition \"A.inDiffPair('*')\"))\n\
+                 (rule \"pair back\" (layer \"B.Cu\") (constraint track_width (opt 0.15mm)) (constraint diff_pair_gap (opt 0.25mm)) (condition \"A.inDiffPair('*')\"))",
+            )
+            .unwrap();
+        let r = route(&b, &rules, &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(r.pairs[0].as_pair, "{}", r.pairs[0].note);
+        assert_eq!(r.vias.len(), 4);
+        for (layer, width, pitch) in [(0usize, 0.3, 0.5), (1usize, 0.15, 0.4)] {
+            let (dp, dn): (Vec<&NewTrack>, Vec<&NewTrack>) = r
+                .tracks
+                .iter()
+                .filter(|t| t.layer == layer)
+                .partition(|t| t.net == "D+");
+            assert!(!dp.is_empty() && !dn.is_empty(), "the pair is not on layer {}", layer);
+            let mut least = f64::INFINITY;
+            for a in &dp {
+                assert!(
+                    (a.width - width).abs() < 1e-9,
+                    "a {} mm track on layer {}",
+                    a.width,
+                    layer
+                );
+                for c in &dn {
+                    least = least.min(geom::seg_seg_dist(a.a, a.b, c.a, c.b));
+                }
+            }
+            assert!(
+                (least - pitch).abs() < 1e-6,
+                "on layer {} the tracks' centre lines come {:.3} mm apart, not {}",
+                layer,
+                least,
+                pitch
+            );
+        }
+        for net in ["D+", "D-"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
     }
 
     #[test]

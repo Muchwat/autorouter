@@ -74,8 +74,8 @@ fn mitre(n1: P, n2: P) -> Result<P, String> {
 /// Build a leg from the centreline.
 ///
 /// `runs`: the centreline per layer, corners only, in order; consecutive runs
-/// meet at the cell where the path changes layer. `half`: half the pitch of
-/// the two tracks (centre to centre). `via_half`: half the pitch of their two
+/// meet at the cell where the path changes layer. `halves`: half the pitch of
+/// the two tracks (centre to centre) on each layer, by layer number. `via_half`: half the pitch of their two
 /// vias, at least; `via_side`: how far to its side of the path a via must
 /// stand for the other track to pass it (they are set wider apart, by as much
 /// as it takes, where the path bends as it changes layer). `first`: +1.0 or -1.0, the side of the path track `a` starts on.
@@ -90,7 +90,7 @@ fn mitre(n1: P, n2: P) -> Result<P, String> {
 /// passes the other's via.
 pub fn leg(
     runs: &[Line],
-    half: f64,
+    halves: &[f64],
     via_half: f64,
     via_side: f64,
     first: f64,
@@ -110,6 +110,7 @@ pub fn leg(
     let reach = 2.0 * via_half;
     for (r, (layer, v)) in runs.iter().enumerate() {
         let (first_run, last_run) = (r == 0, r + 1 == runs.len());
+        let half = *halves.get(*layer).or(halves.last()).ok_or("no pitch for the pair")?;
         let normals: Vec<P> = v.windows(2).map(|s| side(unit(s[0], s[1]))).collect();
         if normals.is_empty() && !first_run && !last_run {
             return Err(no_room()); // a layer it only passes through
@@ -280,7 +281,7 @@ mod tests {
             (15.0 + h * n_end.0, 5.0 + h * n_end.1),
             (15.0 - h * n_end.0, 5.0 - h * n_end.1),
         );
-        let l = leg(&runs, h, 0.45, 0.0, 1.0, start, end, (None, None)).unwrap();
+        let l = leg(&runs, &[h, h], 0.45, 0.0, 1.0, start, end, (None, None)).unwrap();
         assert_eq!(l.a.len(), 1);
         assert!((spacing(&l) - 2.0 * h).abs() < 1e-9, "spacing {}", spacing(&l));
         assert!((l.coupled - (10.0 + 50f64.sqrt())).abs() < 1e-9);
@@ -298,7 +299,7 @@ mod tests {
         let h = 0.2;
         let l = leg(
             &runs,
-            h,
+            &[h, h],
             0.45,
             0.0,
             1.0,
@@ -321,7 +322,7 @@ mod tests {
         ];
         let l = leg(
             &turn,
-            0.175,
+            &[0.175, 0.175],
             0.4,
             0.375,
             1.0,
@@ -354,7 +355,7 @@ mod tests {
         ];
         let l = leg(
             &back,
-            h,
+            &[h, h],
             0.45,
             0.0,
             1.0,
@@ -373,7 +374,7 @@ mod tests {
         let runs = vec![(0usize, vec![(0.0, 0.0), (5.0, 5.0)])];
         let l = leg(
             &runs,
-            0.2,
+            &[0.2, 0.2],
             0.45,
             0.0,
             -1.0,
@@ -387,7 +388,7 @@ mod tests {
         // (the pads are far enough apart for a via each straight in front of them)
         let l = leg(
             &at_once,
-            0.2,
+            &[0.2, 0.2],
             0.45,
             0.0,
             -1.0,
@@ -405,7 +406,7 @@ mod tests {
         let runs = vec![(0usize, vec![(0.0, 0.0), (5.0, 0.0), (0.0, 0.5)])];
         assert!(leg(
             &runs,
-            0.2,
+            &[0.2, 0.2],
             0.45,
             0.0,
             1.0,

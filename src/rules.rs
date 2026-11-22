@@ -95,6 +95,18 @@ pub struct Item<'a> {
     pub kind: Option<&'static str>,
     /// Where the item is, when it is fixed copper.
     pub shape: Option<&'a Shape>,
+    /// The copper layer it is on, when the question is about one layer.
+    pub layer: Option<Layer<'a>>,
+    /// Whether it is a track of a differential pair being routed as one; None
+    /// when that is not known (copper already on the board).
+    pub paired: Option<bool>,
+}
+
+/// A copper layer, as a rule sees it: its name, and whether it is an outer one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layer<'a> {
+    pub name: &'a str,
+    pub outer: bool,
 }
 
 impl<'a> Item<'a> {
@@ -103,6 +115,8 @@ impl<'a> Item<'a> {
             net: Some(net),
             kind: Some("Track"),
             shape: None,
+            layer: None,
+            paired: Some(false),
         }
     }
     pub fn via(net: &'a str) -> Item<'a> {
@@ -110,7 +124,19 @@ impl<'a> Item<'a> {
             net: Some(net),
             kind: Some("Via"),
             shape: None,
+            layer: None,
+            paired: Some(false),
         }
+    }
+    /// The same item on a given layer.
+    pub fn on(mut self, layer: Option<Layer<'a>>) -> Item<'a> {
+        self.layer = layer;
+        self
+    }
+    /// The same item as a track of a differential pair.
+    pub fn in_pair(mut self) -> Item<'a> {
+        self.paired = Some(true);
+        self
     }
 }
 
@@ -172,6 +198,8 @@ pub enum Kind {
     Length,
     /// How far apart in length the two halves of a differential pair may be: `max`.
     Skew,
+    /// The gap between the two tracks of a differential pair: `opt`, else `min`.
+    PairGap,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +215,8 @@ pub struct Rule {
     pub name: String,
     pub constraints: Vec<Constraint>,
     condition: Option<Expr>,
+    /// The layers the rule is for: a name (wildcards allowed), `outer` or `inner`.
+    layer: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +421,7 @@ impl Rules {
                     Some("track_width") => Kind::TrackWidth,
                     Some("edge_clearance") => Kind::EdgeClearance,
                     Some("length") => Kind::Length,
+                    Some("diff_pair_gap") => Kind::PairGap,
                     Some("skew") => Kind::Skew,
                     Some("disallow") => {
                         if c.args().iter().skip(1).any(|a| *a == "via" || *a == "through_via") {
@@ -412,12 +443,7 @@ impl Rules {
             if constraints.is_empty() {
                 continue;
             }
-            if rule.get("layer").is_some() {
-                self.notes.push(format!(
-                    "rule \"{}\" is limited to some layers; the router applies it on every layer",
-                    name
-                ));
-            }
+            let layer = rule.child_text("layer").map(|l| l.to_string());
             let condition = match rule.child_text("condition") {
                 Some(text) => {
                     let e = parse_expr(text);
@@ -435,6 +461,7 @@ impl Rules {
                 name,
                 constraints,
                 condition,
+                layer,
             });
         }
         Ok(())
@@ -538,6 +565,23 @@ impl Rules {
                         Some("Track") => T::No,
                         _ => T::Maybe,
                     },
+                    "inDiffPair" | "isCoupledDiffPair" => match it.paired {
+                        Some(true) => T::Yes,
+                        Some(false) => T::No,
+                        None => T::Maybe,
+                    },
+                    "existsOnLayer" => match (it.layer, it.kind) {
+                        // (a via is on every layer; a track or pad, on the one in question)
+                        (_, Some("Via")) => T::Yes,
+                        (Some(l), _) => {
+                            if wildcard(args.first().map(|s| s.as_str()).unwrap_or(""), l.name) {
+                                T::Yes
+                            } else {
+                                T::No
+                            }
+                        }
+                        (None, _) => T::Maybe,
+                    },
                     _ => T::Maybe,
                 }
             }
@@ -561,6 +605,8 @@ impl Rules {
                     ))
                 } else if prop.eq_ignore_ascii_case("type") {
                     it.kind.map(Cow::Borrowed)
+                } else if prop.eq_ignore_ascii_case("layer") {
+                    it.layer.map(|l| Cow::Borrowed(l.name))
                 } else {
                     None
                 }
@@ -569,7 +615,27 @@ impl Rules {
     }
 
     fn applies(&self, rule: &Rule, a: &Item, b: &Item, pair: bool) -> T {
-        match &rule.condition {
+        // a rule for some layers only: is this one of them?
+        let here = match (&rule.layer, a.layer.or(b.layer)) {
+            (None, _) => T::Yes,
+            (Some(_), None) => T::Maybe,
+            (Some(want), Some(l)) => {
+                let yes = match want.as_str() {
+                    "outer" => l.outer,
+                    "inner" => !l.outer,
+                    name => wildcard(name, l.name),
+                };
+                if yes {
+                    T::Yes
+                } else {
+                    T::No
+                }
+            }
+        };
+        if here == T::No {
+            return T::No;
+        }
+        let holds = match &rule.condition {
             None => T::Yes,
             Some(e) => {
                 let ab = self.eval(e, a, b);
@@ -579,7 +645,16 @@ impl Rules {
                     ab
                 }
             }
-        }
+        };
+        and(here, holds)
+    }
+
+    /// Whether any rule tells one layer from another (a `layer` clause, or a
+    /// condition on `Layer`): when none does, one answer serves every layer.
+    pub fn layered(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.layer.is_some() || r.condition.as_ref().map(mentions_layer).unwrap_or(false))
     }
 
     /// The value of the last rule (in file order) that applies, a rule that
@@ -628,8 +703,50 @@ impl Rules {
     /// last track_width rule that applies; never under a rule's `min` (a floor,
     /// not a target) and, where a `max` applies, not over it.
     pub fn track_width(&self, net: &str) -> f64 {
-        let it = Item::track(net);
-        let mut width = self.class_of(net).track_width;
+        self.width_from(self.class_of(net).track_width, &Item::track(net))
+    }
+
+    /// The width for this net on one layer (a rule may give outer and inner
+    /// layers different widths, for the same impedance on each).
+    pub fn track_width_on(&self, net: &str, layer: Layer) -> f64 {
+        self.width_from(self.class_of(net).track_width, &Item::track(net).on(Some(layer)))
+    }
+
+    /// The width of the tracks of a differential pair on one layer: the class's
+    /// pair width (else its track width), unless a track_width rule says.
+    pub fn pair_width_on(&self, net: &str, layer: Layer) -> f64 {
+        let class = self.class_of(net);
+        let base = if class.pair_width > 0.0 {
+            class.pair_width
+        } else {
+            class.track_width
+        };
+        self.width_from(base, &Item::track(net).on(Some(layer)).in_pair())
+    }
+
+    /// The gap between the two tracks of a pair on one layer: a diff_pair_gap
+    /// rule's, else the class's pair gap, else None (the caller's default).
+    pub fn pair_gap_on(&self, net: &str, layer: Layer) -> Option<f64> {
+        let it = Item::track(net).on(Some(layer)).in_pair();
+        let class = self.class_of(net);
+        let mut gap = if class.pair_gap > 0.0 {
+            Some(class.pair_gap)
+        } else {
+            None
+        };
+        for rule in &self.rules {
+            for c in rule.constraints.iter().filter(|c| c.kind == Kind::PairGap) {
+                if let (Some(v), T::Yes) = (c.opt.or(c.min), self.applies(rule, &it, &it, false)) {
+                    gap = Some(v);
+                }
+            }
+        }
+        gap
+    }
+
+    fn width_from(&self, class_width: f64, it: &Item) -> f64 {
+        let it = *it;
+        let mut width = class_width;
         let (mut floor, mut cap) = (0.0f64, f64::INFINITY);
         for rule in &self.rules {
             for c in rule.constraints.iter().filter(|c| c.kind == Kind::TrackWidth) {
@@ -1017,6 +1134,19 @@ fn literals<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
     }
 }
 
+/// Whether a condition asks which layer an item is on.
+fn mentions_layer(e: &Expr) -> bool {
+    match e {
+        Expr::Or(a, b) | Expr::And(a, b) => mentions_layer(a) || mentions_layer(b),
+        Expr::Not(a) => mentions_layer(a),
+        Expr::Call(_, f, _) => f == "existsOnLayer",
+        Expr::Cmp(l, _, r) => [l, r]
+            .iter()
+            .any(|v| matches!(v, Val::Prop(_, p) if p.eq_ignore_ascii_case("layer"))),
+        Expr::Unknown => false,
+    }
+}
+
 fn contains_unknown(e: &Expr) -> bool {
     match e {
         Expr::Unknown => true,
@@ -1031,12 +1161,15 @@ fn contains_unknown(e: &Expr) -> bool {
                 | "hasNetclass"
                 | "hasExactNetclass"
                 | "isPlated"
+                | "inDiffPair"
+                | "isCoupledDiffPair"
+                | "existsOnLayer"
         ),
         Expr::Cmp(l, _, r) => {
             let known = |v: &Val| match v {
                 Val::Prop(_, p) => matches!(
                     p.to_ascii_lowercase().as_str(),
-                    "netname" | "netclass" | "net_class" | "type"
+                    "netname" | "netclass" | "net_class" | "type" | "layer"
                 ),
                 _ => true,
             };
@@ -1096,6 +1229,8 @@ mod tests {
             net: Some("/N"),
             kind: Some("Pad"),
             shape: Some(&in_q4),
+            layer: None,
+            paired: None,
         };
         // the pad is inside Q4's courtyard, so the 2.5 mm rule does not apply to it
         assert_eq!(r.clearance(&Item::track("/L"), &pad), 0.2);
@@ -1107,6 +1242,8 @@ mod tests {
             net: Some("/N"),
             kind: Some("Pad"),
             shape: Some(&far),
+            layer: None,
+            paired: None,
         };
         assert_eq!(r.clearance(&Item::track("/L"), &pad), 2.5);
     }
@@ -1196,6 +1333,58 @@ mod tests {
         .unwrap();
         let c = r.class_of("/USB_D+");
         assert_eq!((c.pair_width, c.pair_gap, c.pair_via_gap), (0.2, 0.18, 0.25));
+    }
+
+    #[test]
+    fn a_rule_can_be_for_some_layers_only() {
+        let mut r = Rules::default();
+        r.read_dru(
+            "(version 1)\n\
+             (rule \"50 ohm outer\" (layer outer) (constraint track_width (opt 0.30mm)) (condition \"A.NetName == 'RF*'\"))\n\
+             (rule \"50 ohm inner\" (layer inner) (constraint track_width (opt 0.18mm)) (condition \"A.NetName == 'RF*'\"))\n\
+             (rule \"back\" (constraint track_width (opt 0.5mm)) (condition \"A.NetName == 'PWR' && A.Layer == 'B.Cu'\"))\n\
+             (rule \"spacing inside\" (layer \"In1.Cu\") (constraint clearance (min 0.4mm)))\n\
+             (rule \"usb outer\" (layer outer) (constraint track_width (opt 0.2mm)) (constraint diff_pair_gap (opt 0.15mm)) (condition \"A.inDiffPair('*')\"))\n\
+             (rule \"usb inner\" (layer inner) (constraint track_width (opt 0.12mm)) (constraint diff_pair_gap (opt 0.2mm)) (condition \"A.inDiffPair('*')\"))",
+        )
+        .unwrap();
+        assert!(r.layered());
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        let (f, i1, b) = (
+            Layer {
+                name: "F.Cu",
+                outer: true,
+            },
+            Layer {
+                name: "In1.Cu",
+                outer: false,
+            },
+            Layer {
+                name: "B.Cu",
+                outer: true,
+            },
+        );
+        assert_eq!(r.track_width_on("RF_ANT", f), 0.30);
+        assert_eq!(r.track_width_on("RF_ANT", i1), 0.18);
+        assert_eq!(r.track_width_on("RF_ANT", b), 0.30);
+        assert_eq!(
+            r.track_width_on("SDA", i1),
+            0.25,
+            "a pair's rule is not for a single track"
+        );
+        assert_eq!(r.track_width_on("PWR", f), 0.25);
+        assert_eq!(r.track_width_on("PWR", b), 0.5);
+        // with no layer in mind, a rule for some layers might apply: the wider is taken
+        assert_eq!(r.track_width("RF_ANT"), 0.30);
+        // a pair: its own width and gap on each layer
+        assert_eq!((r.pair_width_on("D+", f), r.pair_gap_on("D+", f)), (0.2, Some(0.15)));
+        assert_eq!((r.pair_width_on("D+", i1), r.pair_gap_on("D+", i1)), (0.12, Some(0.2)));
+        // clearance on one layer only
+        let (x, y) = (Item::track("A"), Item::track("B"));
+        assert_eq!(r.clearance(&x.on(Some(i1)), &y.on(Some(i1))), 0.4);
+        assert_eq!(r.clearance(&x.on(Some(f)), &y.on(Some(f))), 0.2);
+        // and a board with no such rule needs one answer only
+        assert!(!Rules::default().layered());
     }
 
     #[test]

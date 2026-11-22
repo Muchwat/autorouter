@@ -172,6 +172,8 @@ fn pieces(board: &Board, rules: &Rules, net: &str, items: &[Copper], gr: &Grid) 
             net: onet.as_deref(),
             kind: None,
             shape: Some(shape),
+            layer: None,
+            paired: None,
         };
         let clr = rules.clearance(&Item::track(net), &other).max(zone_clr);
         for &l in layers {
