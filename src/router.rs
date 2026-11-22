@@ -45,6 +45,17 @@ pub struct Options {
     /// Let a via sit on a surface-mount pad of its own net (kept off by default:
     /// an open hole in a pad drains the solder joint).
     pub via_in_pad: bool,
+    /// Where a track is too wide to reach a pad, finish with a straight piece
+    /// this wide (None: the Default class's width), no thinner than the rules allow.
+    pub neck: Option<f64>,
+    /// The longest such narrow piece, in mm (0: never narrow).
+    pub neck_length: f64,
+    /// Tracks this wide or wider get a second via beside each via, to share the
+    /// current (0: never).
+    pub double_vias: f64,
+    /// Also lay tracks on inner layers that a pour covers (by default such a
+    /// layer is a plane, and stays whole).
+    pub tracks_on_planes: bool,
     /// Print progress to stderr.
     pub progress: bool,
 }
@@ -66,6 +77,10 @@ impl Default for Options {
             via: None,
             no_vias: false,
             via_in_pad: false,
+            neck: None,
+            neck_length: 3.0,
+            double_vias: 0.8,
+            tracks_on_planes: false,
             progress: false,
         }
     }
@@ -92,6 +107,8 @@ pub struct NewVia {
 pub struct NetReport {
     pub net: String,
     pub width: f64,
+    /// Pads reached with a narrowed piece of track, and its width.
+    pub necked: Vec<(String, f64)>,
     /// Separate pieces to join (pads, or pads already joined by copper).
     pub pieces: usize,
     /// Pieces left unjoined, by a pad in each.
@@ -106,6 +123,10 @@ pub struct Routed {
     pub passes: usize,
     /// Nets left alone, and why.
     pub skipped: Vec<(String, String)>,
+    /// Second vias put beside the vias of wide tracks.
+    pub doubled: usize,
+    /// Vias of wide tracks with no room for a second one: (net, where).
+    pub single: Vec<(String, P)>,
     /// Things the user should know about the board or the result.
     pub warnings: Vec<String>,
     pub log: Vec<String>,
@@ -176,6 +197,12 @@ struct Obstacle {
     kind: &'static str,
     shape: Shape,
     layers: Vec<usize>,
+    /// A clearance this item is owed whatever the nets (a drilled hole's own rule).
+    least: f64,
+    /// Obstacles of one group are alike to every rule: nets the rules treat
+    /// alike (same class, same answers to every net-name test), the same kind,
+    /// and the same answers to the rules' tests of place.
+    group: usize,
 }
 
 struct Terminal {
@@ -192,14 +219,17 @@ struct Job {
     /// Extra gap on every clearance of this job: walls and conflicts are tested
     /// at grid points, and a track between two points can pass this much nearer.
     margin: f64,
+    /// The width a track may narrow to at a pad it cannot otherwise reach.
+    neck: Option<f64>,
     terminals: Vec<Terminal>,
     sig: usize,
     span: f64,
 }
 
-/// A cell a job's track may end on to reach a piece: its A* state, and the
-/// pad centre to finish at when the piece is a pad.
-type Entry2 = (u32, Option<P>);
+/// A cell a job's track may end on to reach a piece: its A* state and, when
+/// the track is to be finished at an exact point (a pad's centre, the loose
+/// end of a track), that point and the width of the last piece.
+type Entry2 = (u32, Option<(P, f64)>);
 
 /// The gap the grid costs: a track between two grid points that are each at
 /// least r from some copper passes no nearer than sqrt(r^2 - (step / 2)^2),
@@ -228,9 +258,11 @@ fn joined(a: &(Shape, Vec<usize>, bool, String), b: &(Shape, Vec<usize>, bool, S
 #[derive(Default, Clone)]
 struct Laid {
     paths: Vec<Vec<u32>>,
-    tracks: Vec<(usize, Vec<P>)>,
+    /// (layer, points, width)
+    tracks: Vec<(usize, Vec<P>, f64)>,
     vias: Vec<P>,
     unrouted: Vec<String>,
+    necked: Vec<(String, f64)>,
 }
 
 // ------------------------------------------------------------------- A*
@@ -419,6 +451,10 @@ struct Router<'a> {
     hard: Vec<Option<(Vec<Vec<u8>>, Option<Vec<u8>>)>>,
     /// job -> terminal -> the cells a track may end on
     entries: Vec<Option<Vec<Vec<Entry2>>>>,
+    /// job -> state -> size of the free region it is in
+    rooms: Vec<Option<std::rc::Rc<Vec<u32>>>>,
+    /// job -> obstacle -> the clearance the job's tracks owe it (worked out once, in hard())
+    owed: Vec<Vec<f32>>,
     laid: Vec<Option<Laid>>,
     /// job -> radius (um) -> cells per layer
     contrib: Vec<HashMap<i64, Vec<Vec<u32>>>>,
@@ -426,8 +462,11 @@ struct Router<'a> {
     occ: HashMap<(usize, i64), Vec<Vec<u8>>>,
     hist: Vec<Vec<f32>>,
     work: Work,
-    clr_cache: HashMap<(String, &'static str, Option<String>, &'static str), f64>,
+    clr_cache: HashMap<(String, &'static str, Option<String>, &'static str, Option<u64>), f64>,
     cache_ok: bool,
+    ngroups: usize,
+    /// Inner layers given over to a pour: no tracks there, so the plane stays whole.
+    planes: Vec<usize>,
     log: Vec<String>,
 }
 
@@ -447,15 +486,18 @@ impl<'a> Router<'a> {
         self.log.push(s);
     }
 
+    /// The clearance a owes b, remembered by net and kind and by what the
+    /// rules' tests of place say of b (a, new copper, has no place yet).
     fn clearance(&mut self, a: Item, b: Item) -> f64 {
         if !self.cache_ok {
-            return self.rules.clearance(&a, &b); // some rule asks where an item is
+            return self.rules.clearance(&a, &b);
         }
         let key = (
             a.net.unwrap_or("").to_string(),
             a.kind.unwrap_or(""),
             b.net.map(|s| s.to_string()),
             b.kind.unwrap_or(""),
+            b.shape.map(|s| self.rules.place(s)),
         );
         if let Some(v) = self.clr_cache.get(&key) {
             return *v;
@@ -466,7 +508,7 @@ impl<'a> Router<'a> {
     }
 
     fn layers_ok(&self, l: usize) -> bool {
-        self.opt.layers.as_ref().map(|v| v.contains(&l)).unwrap_or(true)
+        !self.planes.contains(&l) && self.opt.layers.as_ref().map(|v| v.contains(&l)).unwrap_or(true)
     }
 
     /// Walls for job j: (per-layer track walls, via walls).
@@ -534,36 +576,45 @@ impl<'a> Router<'a> {
                 }
             }
         }
-        for o in 0..self.obstacles.len() {
-            if self.obstacles[o].net.as_deref() == Some(net.as_str()) {
+        let mut owed = vec![0f32; self.obstacles.len()];
+        // the rules are asked once for each group of like obstacles: (for a track, for a via)
+        let mut asked: Vec<Option<(f64, f64)>> = vec![None; self.ngroups];
+        for (o, ob) in self.obstacles.iter().enumerate() {
+            if ob.net.as_deref() == Some(net.as_str()) {
                 continue;
             }
-            let (onet, okind, oshape, olayers) = {
-                let ob = &self.obstacles[o];
-                (ob.net.clone(), ob.kind, ob.shape, ob.layers.clone())
-            };
-            let other = Item {
-                net: onet.as_deref(),
-                kind: Some(okind),
-                shape: Some(&oshape),
-            };
-            let rt = self.clearance(Item::track(&net), other) + hw + m;
-            for &l in &olayers {
-                let bl = &mut block[l];
-                self.gr.each(&oshape, rt, |c| bl[c] = 1);
-            }
-            if let Some(vr) = vr {
-                let other = Item {
-                    net: onet.as_deref(),
-                    kind: Some(okind),
-                    shape: Some(&oshape),
-                };
-                let rv = self.clearance(Item::via(&net), other) + vr + m;
-                if let Some(vb) = vblock.as_mut() {
-                    self.gr.each(&oshape, rv, |c| vb[c] = 1);
+            let (ct, cv) = match asked[ob.group] {
+                Some(v) => v,
+                None => {
+                    let other = Item {
+                        net: ob.net.as_deref(),
+                        kind: Some(ob.kind),
+                        shape: Some(&ob.shape),
+                    };
+                    let v = (
+                        self.rules.clearance(&Item::track(&net), &other),
+                        if vr.is_some() {
+                            self.rules.clearance(&Item::via(&net), &other)
+                        } else {
+                            0.0
+                        },
+                    );
+                    asked[ob.group] = Some(v);
+                    v
                 }
+            };
+            let clr = ct.max(ob.least);
+            owed[o] = clr as f32;
+            let rt = clr + hw + m;
+            for &l in &ob.layers {
+                let bl = &mut block[l];
+                self.gr.each(&ob.shape, rt, |c| bl[c] = 1);
+            }
+            if let (Some(vr), Some(vb)) = (vr, vblock.as_mut()) {
+                self.gr.each(&ob.shape, cv.max(ob.least) + vr + m, |c| vb[c] = 1);
             }
         }
+        self.owed[j] = owed;
         // vias and the net's own copper: none in a through-hole pad or on another
         // via (two holes too close), and none on a surface-mount pad unless asked
         if let (Some(vb), Some((vd, drill))) = (vblock.as_mut(), self.jobs[j].via) {
@@ -586,8 +637,7 @@ impl<'a> Router<'a> {
 
     /// Whether a track of job j from a to b on layer l keeps every clearance to
     /// the copper in `near` and to the board edge, measured exactly.
-    fn stub_ok(&self, j: usize, a: P, b: P, l: usize, near: &[(usize, f64)], edge: f64) -> bool {
-        let hw = self.jobs[j].width / 2.0;
+    fn stub_ok(&self, hw: f64, a: P, b: P, l: usize, near: &[(usize, f64)], edge: f64) -> bool {
         let (x0, y0, x1, y1) = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
         for &(o, clr) in near {
             let ob = &self.obstacles[o];
@@ -613,25 +663,158 @@ impl<'a> Router<'a> {
         })
     }
 
-    /// The cells job j's tracks may end on, per terminal. On existing copper,
-    /// any free cell on it. On a pad, a free cell on it (or, for a pad no free
-    /// grid point falls on, just beside it) from which a track to the pad's
-    /// centre keeps every clearance: the track is finished there, since KiCad
-    /// joins a track to a pad at its centre or where the track ends on it.
+    /// Other nets' copper within `reach` of a shape, with the clearance job j owes each.
+    fn near(&mut self, j: usize, bbox: (f64, f64, f64, f64), reach: f64) -> Vec<(usize, f64)> {
+        if self.owed[j].is_empty() {
+            self.hard(j);
+        }
+        let net = self.jobs[j].net.as_str();
+        let owed = &self.owed[j];
+        let mut near: Vec<(usize, f64)> = Vec::new();
+        for (o, ob) in self.obstacles.iter().enumerate() {
+            if ob.net.as_deref() == Some(net) {
+                continue;
+            }
+            let bb = ob.shape.bbox();
+            let gap = (bb.0 - bbox.2).max(bbox.0 - bb.2).max(bb.1 - bbox.3).max(bbox.1 - bb.3);
+            let clr = owed[o] as f64;
+            if gap <= clr + reach + 0.01 {
+                near.push((o, clr));
+            }
+        }
+        near
+    }
+
+    /// For each state (layer * n + cell) a track of job j may be on, the size of
+    /// the free region it lies in: the states it can walk to, vias included. A
+    /// small number is a pocket, shut in by other nets' pads and copper.
+    fn room(&mut self, j: usize) -> std::rc::Rc<Vec<u32>> {
+        if let Some(r) = &self.rooms[j] {
+            return r.clone();
+        }
+        let (nl, n, w, h) = (self.gr.nl, self.gr.n, self.gr.w, self.gr.h);
+        let (block, vblock) = self.hard(j);
+        let mut label = vec![u32::MAX; n * nl];
+        let mut sizes: Vec<u32> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for start in 0..n * nl {
+            if label[start] != u32::MAX || block[start / n][start % n] != 0 {
+                continue;
+            }
+            let id = sizes.len() as u32;
+            let mut size = 0u32;
+            label[start] = id;
+            stack.push(start);
+            while let Some(s) = stack.pop() {
+                size += 1;
+                let (l, c) = (s / n, s % n);
+                let (i, jj) = (c % w, c / w);
+                let go = |t: usize, label: &mut Vec<u32>, stack: &mut Vec<usize>| {
+                    if label[t] == u32::MAX && block[t / n][t % n] == 0 {
+                        label[t] = id;
+                        stack.push(t);
+                    }
+                };
+                if i > 0 {
+                    go(s - 1, &mut label, &mut stack);
+                }
+                if i + 1 < w {
+                    go(s + 1, &mut label, &mut stack);
+                }
+                if jj > 0 {
+                    go(s - w, &mut label, &mut stack);
+                }
+                if jj + 1 < h {
+                    go(s + w, &mut label, &mut stack);
+                }
+                if vblock.as_ref().map(|v| v[c] == 0).unwrap_or(false) {
+                    for l2 in 0..nl {
+                        if l2 != l {
+                            go(l2 * n + c, &mut label, &mut stack);
+                        }
+                    }
+                }
+            }
+            sizes.push(size);
+        }
+        let room: Vec<u32> = label
+            .iter()
+            .map(|&id| if id == u32::MAX { 0 } else { sizes[id as usize] })
+            .collect();
+        let room = std::rc::Rc::new(room);
+        self.rooms[j] = Some(room.clone());
+        room
+    }
+
+    /// The cells job j's tracks may end on, per terminal.
+    ///
+    /// On a pad: a free cell on it (or, for a pad no free grid point falls on,
+    /// just beside it) from which a track to the pad's centre keeps every
+    /// clearance; the track is finished there, since KiCad joins a track to a
+    /// pad at its centre or where the track ends on it. Where the track is too
+    /// wide to get that near, or gets there only inside a pocket it cannot
+    /// leave, also the nearest cells with room around them from which a
+    /// straight, narrower piece reaches the centre.
+    ///
+    /// On existing copper: where a track of the piece has a loose end (a
+    /// fan-out, a half-drawn track), at that end, so it is not left dangling;
+    /// otherwise any free cell on the copper.
     fn entries(&mut self, j: usize) -> Vec<Vec<Entry2>> {
         if let Some(e) = &self.entries[j] {
             return e.clone();
         }
-        let n = self.gr.n;
+        let (n, g) = (self.gr.n, self.gr.g);
         let (block, _) = self.hard(j);
         let net = self.jobs[j].net.clone();
-        let hw = self.jobs[j].width / 2.0;
+        let (width, neck) = (self.jobs[j].width, self.jobs[j].neck);
+        let hw = width / 2.0;
         let edge = self.rules.edge_clearance(&net);
-        let reach = 1.5 * self.gr.g;
+        let beside = 1.5 * g;
+        let neck_len = if neck.is_some() { self.opt.neck_length } else { 0.0 };
+        let room = self.room(j);
+        let roomy = room.iter().cloned().max().unwrap_or(0) / 20; // a twentieth of the largest region
         let mut all: Vec<Vec<Entry2>> = Vec::new();
         for t in 0..self.jobs[j].terminals.len() {
             let parts = self.jobs[j].terminals[t].parts.clone();
+            // loose ends of the piece's tracks: (point, layer, track width)
+            let mut loose: Vec<(P, usize, f64)> = Vec::new();
+            for (i, (shape, layers, is_pad)) in parts.iter().enumerate() {
+                if let (Shape::Capsule { a, b, r }, false) = (shape, *is_pad) {
+                    for end in [*a, *b] {
+                        let held = parts.iter().enumerate().any(|(k, (other, ol, _))| {
+                            k != i && layers.iter().any(|l| ol.contains(l)) && other.dist(end) <= 1e-6
+                        });
+                        if !held {
+                            loose.push((end, layers[0], 2.0 * r));
+                        }
+                    }
+                }
+            }
             let mut st: Vec<Entry2> = Vec::new();
+            for &(end, l, _) in &loose {
+                if !self.layers_ok(l) {
+                    continue;
+                }
+                let near = self.near(j, (end.0, end.1, end.0, end.1), hw + beside);
+                let mut cells: Vec<usize> = Vec::new();
+                let bl = &block[l];
+                self.gr.each(&Shape::Circle { c: end, r: 0.0 }, beside, |c| {
+                    if bl[c] == 0 {
+                        cells.push(c);
+                    }
+                });
+                for c in cells {
+                    if self.stub_ok(hw, self.gr.xy(c), end, l, &near, edge) {
+                        st.push(((l * n + c) as u32, Some((end, width))));
+                    }
+                }
+            }
+            if !st.is_empty() {
+                st.sort_by(|a, b| a.0.cmp(&b.0));
+                st.dedup_by(|a, b| a.0 == b.0);
+                all.push(st);
+                continue;
+            }
             for (shape, layers, is_pad) in &parts {
                 if !*is_pad {
                     for &l in layers {
@@ -646,39 +829,16 @@ impl<'a> Router<'a> {
                     }
                     continue;
                 }
-                // other nets' copper near enough to matter to a track ending here
-                let pb = shape.bbox();
-                let mut near: Vec<(usize, f64)> = Vec::new();
-                for o in 0..self.obstacles.len() {
-                    if self.obstacles[o].net.as_deref() == Some(net.as_str()) {
-                        continue;
-                    }
-                    let (onet, okind, oshape) = (
-                        self.obstacles[o].net.clone(),
-                        self.obstacles[o].kind,
-                        self.obstacles[o].shape,
-                    );
-                    let bb = oshape.bbox();
-                    let gap = (bb.0 - pb.2).max(pb.0 - bb.2).max(bb.1 - pb.3).max(pb.1 - bb.3);
-                    if gap > 30.0 {
-                        continue; // farther than any clearance
-                    }
-                    let other = Item {
-                        net: onet.as_deref(),
-                        kind: Some(okind),
-                        shape: Some(&oshape),
-                    };
-                    let clr = self.clearance(Item::track(&net), other);
-                    if gap <= clr + hw + reach + 0.01 {
-                        near.push((o, clr));
-                    }
-                }
+                let near = self.near(j, shape.bbox(), hw + beside.max(neck_len));
                 let centre = shape.centre();
                 for &l in layers {
                     if !self.layers_ok(l) {
                         continue;
                     }
-                    for r in [0.0, reach] {
+                    // at full width: on the pad, else just beside it
+                    let before = st.len();
+                    let open = |st: &Vec<Entry2>| st[before..].iter().any(|e| room[e.0 as usize] >= roomy);
+                    for r in [0.0, beside] {
                         let mut cells: Vec<usize> = Vec::new();
                         let bl = &block[l];
                         self.gr.each(shape, r, |c| {
@@ -686,14 +846,41 @@ impl<'a> Router<'a> {
                                 cells.push(c);
                             }
                         });
-                        let before = st.len();
                         for c in cells {
-                            if self.stub_ok(j, self.gr.xy(c), centre, l, &near, edge) {
-                                st.push(((l * n + c) as u32, Some(centre)));
+                            if self.stub_ok(hw, self.gr.xy(c), centre, l, &near, edge) {
+                                st.push(((l * n + c) as u32, Some((centre, width))));
                             }
                         }
-                        if st.len() > before {
-                            break; // cells on the pad itself, when it has any
+                        if open(&st) {
+                            break;
+                        }
+                    }
+                    if open(&st) {
+                        continue;
+                    }
+                    // too wide to get there, or only into a pocket: the nearest cells with
+                    // room around them that a narrower piece reaches from
+                    if let Some(nw) = neck {
+                        let mut cells: Vec<(f64, usize)> = Vec::new();
+                        let bl = &block[l];
+                        self.gr.each(shape, neck_len, |c| {
+                            if bl[c] == 0 && room[l * n + c] >= roomy {
+                                cells.push((0.0, c));
+                            }
+                        });
+                        for e in cells.iter_mut() {
+                            e.0 = geom::dist(self.gr.xy(e.1), centre);
+                        }
+                        cells.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+                        let mut nearest: Option<f64> = None;
+                        for (d, c) in cells {
+                            if nearest.map(|m| d > m + 2.0 * g).unwrap_or(false) {
+                                break;
+                            }
+                            if self.stub_ok(nw / 2.0, self.gr.xy(c), centre, l, &near, edge) {
+                                nearest.get_or_insert(d);
+                                st.push(((l * n + c) as u32, Some((centre, nw))));
+                            }
                         }
                     }
                 }
@@ -716,9 +903,16 @@ impl<'a> Router<'a> {
             .map(|(_, jb)| jb.net.clone())?;
         let net = self.jobs[j].net.clone();
         let me = if via { Item::via(&net) } else { Item::track(&net) };
-        let c = self
+        let mut c = self
             .clearance(me, Item::track(&rep))
             .max(self.clearance(me, Item::via(&rep)));
+        if via {
+            // two vias: their holes keep the board's hole-to-hole gap as well
+            let other = self.jobs.iter().find(|jb| jb.net == rep).and_then(|jb| jb.via);
+            if let (Some((d1, h1)), Some((d2, h2))) = (self.jobs[j].via, other) {
+                c = c.max(self.rules.hole_to_hole + (h1 + h2) / 2.0 - (d1 + d2) / 2.0);
+            }
+        }
         let half = if via {
             self.jobs[j].via?.0 / 2.0
         } else {
@@ -736,8 +930,7 @@ impl<'a> Router<'a> {
         let mark = self.work.next_mark();
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); nl];
         if let Some(laid) = &self.laid[k] {
-            let w = self.jobs[k].width;
-            for (l, pts) in &laid.tracks {
+            for (l, pts, w) in &laid.tracks {
                 for s in pts.windows(2) {
                     let sh = Shape::Capsule {
                         a: s[0],
@@ -899,6 +1092,151 @@ impl<'a> Router<'a> {
         bad
     }
 
+    /// Put a second via beside each via of job j, joined to the first on every
+    /// layer the net has a track at it: one small via is the weak point of a wide
+    /// track. Returns (added, vias left single).
+    fn double_vias(&mut self, j: usize) -> (usize, Vec<P>) {
+        let drill = match self.jobs[j].via {
+            Some(v) => v.1,
+            None => return (0, Vec::new()),
+        };
+        let laid = match &self.laid[j] {
+            Some(l) if !l.vias.is_empty() => l.clone(),
+            _ => return (0, Vec::new()),
+        };
+        let (nl, g, w) = (self.gr.nl, self.gr.g, self.gr.w as i64);
+        let width = self.jobs[j].width;
+        let (block, vblock) = self.hard(j);
+        let vblock = match vblock {
+            Some(v) => v,
+            None => return (0, Vec::new()),
+        };
+        let (soft, sv) = self.soft(j);
+        // two holes no nearer than the board's hole-to-hole gap, edge to edge
+        let apart = drill + self.rules.hole_to_hole;
+        let mut holes: Vec<P> = laid.vias.clone();
+        for t in &self.jobs[j].terminals {
+            for (shape, layers, is_pad) in &t.parts {
+                if layers.len() == nl && (*is_pad || matches!(shape, Shape::Circle { .. })) {
+                    holes.push(shape.centre());
+                }
+            }
+        }
+        let straight = (apart / g - 1e-9).ceil().max(1.0) as i64;
+        let diagonal = (apart / (g * SQRT2) - 1e-9).ceil().max(1.0) as i64;
+        let mut steps: Vec<(i64, i64, i64)> = Vec::new(); // (di, dj, cells)
+        for &(di, dj, _) in DIRS.iter() {
+            steps.push((di, dj, if di != 0 && dj != 0 { diagonal } else { straight }));
+        }
+        let mut new_tracks: Vec<(usize, Vec<P>, f64)> = Vec::new();
+        let mut new_vias: Vec<P> = Vec::new();
+        let mut single: Vec<P> = Vec::new();
+        for &p in &laid.vias {
+            let c = self.gr.cell(p) as i64;
+            // the layers the net's tracks meet this via on
+            let layers: Vec<usize> = (0..nl)
+                .filter(|&l| {
+                    laid.tracks
+                        .iter()
+                        .any(|(tl, pts, _)| *tl == l && pts.iter().any(|q| geom::dist(*q, p) < 1e-6))
+                })
+                .collect();
+            let mut placed = false;
+            for &(di, dj, k) in &steps {
+                let (i, jj) = (c % w + di * k, c / w + dj * k);
+                if i < 0 || i >= w || jj < 0 || jj >= self.gr.h as i64 {
+                    continue;
+                }
+                let c2 = (jj * w + i) as usize;
+                if vblock[c2] != 0 || sv[c2] != 0 {
+                    continue;
+                }
+                let p2 = self.gr.xy(c2);
+                if holes.iter().any(|h| geom::dist(*h, p2) < apart - 1e-9) {
+                    continue;
+                }
+                // the link between the two, on each layer, over free cells only
+                let clear = layers.iter().all(|&l| {
+                    (0..=k).all(|t| {
+                        let cc = ((c / w + dj * t) * w + (c % w + di * t)) as usize;
+                        block[l][cc] == 0 && soft[l][cc] == 0
+                    })
+                });
+                if !clear {
+                    continue;
+                }
+                for &l in &layers {
+                    new_tracks.push((l, vec![p, p2], width));
+                }
+                new_vias.push(p2);
+                holes.push(p2);
+                placed = true;
+                break;
+            }
+            if !placed {
+                single.push(p);
+            }
+        }
+        let added = new_vias.len();
+        if added > 0 {
+            self.add(j, -1);
+            if let Some(l) = self.laid[j].as_mut() {
+                l.tracks.extend(new_tracks);
+                l.vias.extend(new_vias);
+            }
+            self.contrib[j].clear();
+            self.add(j, 1);
+        }
+        (added, single)
+    }
+
+    /// The jobs whose copper job j's track cells or vias are too close to. A
+    /// conflict is found from j's side only (its grid points against the other's
+    /// copper), so the other party would otherwise never be asked to move.
+    fn offenders(&mut self, j: usize) -> Vec<usize> {
+        let laid = match &self.laid[j] {
+            Some(l) => l.clone(),
+            None => return Vec::new(),
+        };
+        let (nl, n) = (self.gr.nl, self.gr.n);
+        let mut mine = vec![0u8; n * nl]; // 1: a track cell of j, 2: a via of j
+        for p in &laid.paths {
+            for &s in p {
+                mine[s as usize] |= 1;
+            }
+        }
+        for &v in &laid.vias {
+            let c = self.gr.cell(v);
+            for l in 0..nl {
+                mine[l * n + c] |= 2;
+            }
+        }
+        let mut out = Vec::new();
+        for k in 0..self.jobs.len() {
+            if k == j || self.laid[k].is_none() {
+                continue;
+            }
+            let sig = self.jobs[k].sig;
+            let mut hit = false;
+            for (via, bit) in [(false, 1u8), (true, 2u8)] {
+                if hit {
+                    break;
+                }
+                if let Some(r) = self.radius(j, sig, via) {
+                    let c = self.contribution(k, r);
+                    hit = c
+                        .iter()
+                        .enumerate()
+                        .any(|(l, cells)| cells.iter().any(|&cell| mine[l * n + cell as usize] & bit != 0));
+                }
+            }
+            if hit {
+                out.push(k);
+            }
+        }
+        out
+    }
+
     fn route_job(&mut self, j: usize, pres: f64, via_cost: f64, limit: usize, walls: bool) {
         let (nl, n) = (self.gr.nl, self.gr.n);
         let (mut block, vhard) = self.hard(j);
@@ -931,12 +1269,13 @@ impl<'a> Router<'a> {
             })
             .collect();
         let states: Vec<Vec<u32>> = entries.iter().map(|t| t.iter().map(|e| e.0).collect()).collect();
-        let centre_of = |t: usize, s: u32| -> Option<P> {
+        let centre_of = |t: usize, s: u32| -> Option<(P, f64)> {
             entries[t]
                 .binary_search_by(|e| e.0.cmp(&s))
                 .ok()
                 .and_then(|k| entries[t][k].1)
         };
+        let room = self.room(j);
         let terms = self.jobs[j].terminals.len();
         let centre = |t: usize| -> P { self.jobs[j].terminals[t].centre };
         let mut todo: Vec<usize> = (0..terms).collect();
@@ -956,12 +1295,14 @@ impl<'a> Router<'a> {
         todo.retain(|&t| t != first);
         let mut tree: Vec<u32> = states[first].clone();
         // tree cells that lie on a pad already joined, and whether its last bit of track is laid
-        let mut tree_pad: HashMap<u32, (P, bool)> = HashMap::new();
+        let mut tree_pad: HashMap<u32, ((P, f64), bool)> = HashMap::new();
         for e in &entries[first] {
             if let Some(c) = e.1 {
                 tree_pad.insert(e.0, (c, false));
             }
         }
+        let width = self.jobs[j].width;
+        let first_label = self.jobs[j].terminals[first].label.clone();
         let mut near: Vec<f64> = (0..terms).map(|t| geom::dist(centre(t), centre(first))).collect();
         let mut laid = Laid::default();
         let search_via = if vblock.is_some() { via_cost } else { 0.0 };
@@ -971,7 +1312,8 @@ impl<'a> Router<'a> {
             let next = todo.remove(0);
             let label = self.jobs[j].terminals[next].label.clone();
             if states[next].is_empty() {
-                laid.unrouted.push(label);
+                laid.unrouted
+                    .push(format!("{}: no clear way in for a {} mm track", label, width));
                 continue;
             }
             let s = Search {
@@ -985,7 +1327,23 @@ impl<'a> Router<'a> {
                 limit,
             };
             match astar(&self.gr, &mut self.work, &s, &tree, &states[next], centre(next)) {
-                None => laid.unrouted.push(label),
+                None => {
+                    // say which side is shut in, when one is
+                    let most = |st: &[u32]| st.iter().map(|&s| room[s as usize]).max().unwrap_or(0);
+                    let (here, there) = (most(&states[next]), most(&tree));
+                    let whole = room.iter().cloned().max().unwrap_or(0);
+                    let why = if here < whole / 20 {
+                        format!(
+                            "shut in: only {:.1} mm2 of room around it",
+                            here as f64 * self.gr.g * self.gr.g
+                        )
+                    } else if there < whole / 20 {
+                        "the rest of the net is shut in".to_string()
+                    } else {
+                        "no path between other nets' copper".to_string()
+                    };
+                    laid.unrouted.push(format!("{}: {}", label, why));
+                }
                 Some(path) => {
                     for t in 0..terms {
                         near[t] = near[t].min(geom::dist(centre(t), centre(next)));
@@ -1015,7 +1373,14 @@ impl<'a> Router<'a> {
                             v.1 = true;
                         }
                     }
-                    self.geometry(&path, from, to, &mut laid);
+                    for (end, name) in [(from, &first_label), (to, &label)] {
+                        if let Some((_, w)) = end {
+                            if w < width - 1e-9 && !laid.necked.iter().any(|(n, _)| n == name) {
+                                laid.necked.push((name.clone(), w));
+                            }
+                        }
+                    }
+                    self.geometry(&path, width, from, to, &mut laid);
                     laid.paths.push(path);
                 }
             }
@@ -1026,9 +1391,10 @@ impl<'a> Router<'a> {
         self.add(j, 1);
     }
 
-    /// Turn a path of states into tracks and vias. `from` and `to` are the pad
-    /// centres to start and finish on, when the path's ends are on pads.
-    fn geometry(&self, path: &[u32], from: Option<P>, to: Option<P>, laid: &mut Laid) {
+    /// Turn a path of states into tracks and vias. `from` and `to` are the
+    /// points to start and finish on (a pad's centre, a track's loose end) and
+    /// the width of that piece, when the path's ends call for them.
+    fn geometry(&self, path: &[u32], width: f64, from: Option<(P, f64)>, to: Option<(P, f64)>, laid: &mut Laid) {
         let n = self.gr.n;
         let mut runs: Vec<(usize, Vec<P>)> = Vec::new();
         for (k, &s) in path.iter().enumerate() {
@@ -1045,12 +1411,22 @@ impl<'a> Router<'a> {
             }
         }
         // (a path of one cell, where the tree already crosses the pad, is still
-        // finished on the pad's centre)
-        if let Some(pc) = from {
-            runs[0].1.insert(0, pc);
-        }
-        if let Some(pc) = to {
-            runs.last_mut().unwrap().1.push(pc);
+        // finished on the pad's centre.) A narrowed piece is a track of its own.
+        let last = runs.len() - 1;
+        for (end, at_start) in [(from, true), (to, false)] {
+            if let Some((pc, w)) = end {
+                let (l, pts) = &mut runs[if at_start { 0 } else { last }];
+                let cell = if at_start { pts[0] } else { pts[pts.len() - 1] };
+                if w < width - 1e-9 {
+                    if geom::dist(cell, pc) > 1e-6 {
+                        laid.tracks.push((*l, vec![cell, pc], w));
+                    }
+                } else if at_start {
+                    pts.insert(0, pc);
+                } else {
+                    pts.push(pc);
+                }
+            }
         }
         for (l, pts) in runs {
             let mut simp: Vec<P> = Vec::new();
@@ -1069,10 +1445,41 @@ impl<'a> Router<'a> {
                 simp.push(p);
             }
             if simp.len() >= 2 {
-                laid.tracks.push((l, simp));
+                laid.tracks.push((l, simp, width));
             }
         }
     }
+}
+
+/// Inner layers where copper pours cover at least half the board: planes.
+pub fn plane_layers(board: &Board) -> Vec<usize> {
+    let nl = board.copper.len();
+    let (x0, y0, x1, y1) = match board.extent() {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let whole = (x1 - x0) * (y1 - y0);
+    (1..nl.saturating_sub(1))
+        .filter(|&l| {
+            let poured: f64 = board
+                .zones
+                .iter()
+                .filter(|z| z.keepout.is_none() && z.net.is_some() && z.layers.contains(&l))
+                .map(|z| {
+                    let p = &z.outline;
+                    (0..p.len())
+                        .map(|i| {
+                            let (a, b) = (p[i], p[(i + 1) % p.len()]);
+                            a.0 * b.1 - b.0 * a.1
+                        })
+                        .sum::<f64>()
+                        .abs()
+                        / 2.0
+                })
+                .sum();
+            whole > 0.0 && poured >= 0.5 * whole
+        })
+        .collect()
 }
 
 /// Whether `route` would take on this net (the same test it uses), for
@@ -1182,6 +1589,8 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             kind: "Pad",
             shape: p.shape,
             layers: p.layers.clone(),
+            least: 0.0,
+            group: 0,
         });
     }
     for t in &board.tracks {
@@ -1194,6 +1603,8 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                 r: t.width / 2.0,
             },
             layers: vec![t.layer],
+            least: 0.0,
+            group: 0,
         });
     }
     for v in &board.vias {
@@ -1205,6 +1616,8 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                 r: v.diameter / 2.0,
             },
             layers: (0..nl).collect(),
+            least: 0.0,
+            group: 0,
         });
     }
     for &shape in &board.holes {
@@ -1213,8 +1626,21 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             kind: "Pad",
             shape,
             layers: (0..nl).collect(),
+            least: rules.hole_clearance,
+            group: 0,
         });
     }
+    let mut groups: HashMap<(Option<String>, &'static str, u64), usize> = HashMap::new();
+    let mut net_sig: HashMap<String, String> = HashMap::new();
+    for ob in obstacles.iter_mut() {
+        let sig = ob
+            .net
+            .as_ref()
+            .map(|n| net_sig.entry(n.clone()).or_insert_with(|| rules.signature(n)).clone());
+        let next = groups.len();
+        ob.group = *groups.entry((sig, ob.kind, rules.place(&ob.shape))).or_insert(next);
+    }
+    let ngroups = groups.len();
 
     // what to join: per net, the pieces its pads and copper already form
     let poured = board.poured_nets();
@@ -1354,11 +1780,21 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             sy1 = sy1.max(t.centre.1);
         }
         let margin = opt.margin.max(grid_margin(width / 2.0 + smallest, g));
+        let neck = opt
+            .neck
+            .unwrap_or(rules.classes[0].track_width)
+            .max(rules.track_floor(&net));
+        let neck = if opt.neck_length > 0.0 && neck < width - 1e-9 {
+            Some(neck)
+        } else {
+            None
+        };
         jobs.push(Job {
             net,
             width,
             via,
             margin,
+            neck,
             terminals,
             sig,
             span: (sx1 - sx0) + (sy1 - sy0),
@@ -1367,8 +1803,28 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
     // short nets first: they have the fewest ways round
     jobs.sort_by(|a, b| a.span.partial_cmp(&b.span).unwrap().then(a.net.cmp(&b.net)));
     let nj = jobs.len();
-    let cache_ok = !rules.rules.iter().any(|r| format!("{:?}", r).contains("Courtyard"));
+    let cache_ok = rules.place_is_whole();
+    let planes = if opt.tracks_on_planes {
+        Vec::new()
+    } else {
+        plane_layers(board)
+    };
+    if !planes.is_empty() {
+        out.log.push(format!(
+            "keeping tracks off the plane layer(s) {} (--tracks-on-planes to use them)",
+            planes
+                .iter()
+                .map(|&l| board.copper[l].clone())
+                .collect::<Vec<String>>()
+                .join(", ")
+        ));
+        if opt.progress {
+            eprintln!("{}", out.log[out.log.len() - 1]);
+        }
+    }
     let mut r = Router {
+        planes,
+        ngroups,
         board,
         rules,
         opt,
@@ -1376,6 +1832,8 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         outside,
         hard: (0..nj).map(|_| None).collect(),
         entries: (0..nj).map(|_| None).collect(),
+        rooms: (0..nj).map(|_| None).collect(),
+        owed: vec![Vec::new(); nj],
         laid: vec![None; nj],
         contrib: vec![HashMap::new(); nj],
         occ: HashMap::new(),
@@ -1457,7 +1915,13 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                 r.hist[l][c] += 0.5;
             }
         }
+        // those in conflict, and those they are in conflict with
         todo = conflicts.keys().cloned().collect();
+        for j in conflicts.keys().cloned().collect::<Vec<usize>>() {
+            todo.extend(r.offenders(j));
+        }
+        todo.sort();
+        todo.dedup();
         pres *= 1.6;
     }
     // what is still in conflict is routed with the others as walls, until nothing is;
@@ -1472,9 +1936,36 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             if r.conflicts(j).is_empty() {
                 continue;
             }
+            let others = r.offenders(j);
             r.rip(j);
             if round < 5 {
                 r.route_job(j, pres, opt.via_cost, opt.limit * 4, true);
+                // squeezed out? Then it goes first and the ones in its way go round it,
+                // if that leaves less unjoined
+                let left = |r: &Router, k: usize| r.laid[k].as_ref().map(|l| l.unrouted.len()).unwrap_or(0);
+                if left(&r, j) > 0 && !others.is_empty() {
+                    let mut group = vec![j];
+                    group.extend(&others);
+                    let before: usize = group.iter().map(|&k| left(&r, k)).sum();
+                    let saved: Vec<Option<Laid>> = group.iter().map(|&k| r.laid[k].clone()).collect();
+                    for &k in &group {
+                        r.rip(k);
+                    }
+                    for &k in &group {
+                        r.route_job(k, pres, opt.via_cost, opt.limit * 4, true);
+                    }
+                    let after: usize = group.iter().map(|&k| left(&r, k)).sum();
+                    if after >= before {
+                        for &k in &group {
+                            r.rip(k);
+                        }
+                        for (&k, old) in group.iter().zip(saved) {
+                            r.laid[k] = old;
+                            r.contrib[k].clear();
+                            r.add(k, 1);
+                        }
+                    }
+                }
             } else {
                 let all: Vec<String> = r.jobs[j].terminals.iter().skip(1).map(|t| t.label.clone()).collect();
                 r.laid[j] = Some(Laid {
@@ -1503,17 +1994,37 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         }
     }
 
+    // wide tracks: a second via beside each via
+    if opt.double_vias > 0.0 {
+        for j in 0..nj {
+            if r.jobs[j].width >= opt.double_vias - 1e-9 {
+                let (added, single) = r.double_vias(j);
+                out.doubled += added;
+                let net = r.jobs[j].net.clone();
+                out.single.extend(single.into_iter().map(|p| (net.clone(), p)));
+            }
+        }
+        if out.doubled > 0 || !out.single.is_empty() {
+            r.say(format!(
+                "  second vias on tracks of {} mm and wider: {} added, {} with no room",
+                opt.double_vias,
+                out.doubled,
+                out.single.len()
+            ));
+        }
+    }
+
     for j in 0..nj {
         let job = &r.jobs[j];
         let laid = r.laid[j].clone().unwrap_or_default();
-        for (l, pts) in &laid.tracks {
+        for (l, pts, w) in &laid.tracks {
             for s in pts.windows(2) {
                 out.tracks.push(NewTrack {
                     net: job.net.clone(),
                     layer: *l,
                     a: s[0],
                     b: s[1],
-                    width: job.width,
+                    width: *w,
                 });
             }
         }
@@ -1530,6 +2041,7 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         out.nets.push(NetReport {
             net: job.net.clone(),
             width: job.width,
+            necked: laid.necked.clone(),
             pieces: job.terminals.len(),
             unrouted: laid.unrouted.clone(),
         });
@@ -1557,6 +2069,7 @@ mod tests {
     fn rules() -> Rules {
         let mut r = Rules::default();
         r.edge_clearance = 0.2;
+        r.hole_to_hole = 0.5;
         r
     }
 
@@ -1761,7 +2274,7 @@ mod tests {
         let slot = b.holes[0];
         for t in &r.tracks {
             let d = geom::seg_shape_dist(t.a, t.b, &slot) - t.width / 2.0;
-            assert!(d >= 0.2 - 1e-6, "a track passes {:.3} mm from the slot", d);
+            assert!(d >= 0.25 - 1e-6, "a track passes {:.3} mm from the slot", d);
         }
     }
 
@@ -1813,6 +2326,164 @@ mod tests {
         assert_eq!(r.nets.len(), 1, "the net still needs joining");
         assert_eq!(r.nets[0].pieces, 2);
         assert!(r.complete());
+    }
+
+    #[test]
+    fn wide_tracks_get_a_second_via() {
+        // one wide net that has to change layer under a wall of another net's track
+        let s = String::from(HEAD)
+            + &smd("A", "P", 3.0, 10.0, 2.0, 2.0)
+            + &smd("B", "P", 27.0, 10.0, 2.0, 2.0)
+            + &smd("C", "S", 15.0, 1.0, 0.8, 0.8)
+            + &smd("D", "S", 15.0, 19.0, 0.8, 0.8)
+            + "(segment (start 15 1) (end 15 19) (width 0.25) (layer \"F.Cu\") (net \"S\"))\n"
+            + "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let opt = Options {
+            track_width: Some(1.2),
+            via: Some((0.6, 0.3)),
+            ..Options::default()
+        };
+        let r = route(&b, &rules(), &opt);
+        assert!(r.complete(), "{:?}", r.nets);
+        assert_eq!(r.vias.len(), 4, "two crossings of the layer, each with a second via");
+        assert_eq!(r.doubled, 2);
+        assert!(smallest_gap(&b, &r) >= 0.2 - 1e-6);
+        // the pairs are joined, and their holes keep apart
+        assert!(kicad_joined(&b, &r, "P"));
+        for (i, v) in r.vias.iter().enumerate() {
+            for u in &r.vias[i + 1..] {
+                assert!(
+                    geom::dist(v.at, u.at) >= 0.3 + 0.5 - 1e-9,
+                    "two holes {:.3} mm apart",
+                    geom::dist(v.at, u.at)
+                );
+            }
+        }
+        // and none when it is turned off
+        let off = route(
+            &b,
+            &rules(),
+            &Options {
+                double_vias: 0.0,
+                ..opt
+            },
+        );
+        assert_eq!(off.vias.len(), 2);
+    }
+
+    #[test]
+    fn the_same_board_routes_the_same_way_every_time() {
+        let b = crossing();
+        let (one, two) = (
+            route(&b, &rules(), &Options::default()),
+            route(&b, &rules(), &Options::default()),
+        );
+        assert_eq!(one.tracks, two.tracks);
+        assert_eq!(one.vias, two.vias);
+    }
+
+    #[test]
+    fn a_wide_track_narrows_to_reach_a_small_pad() {
+        // a 1.2 mm track cannot get between the neighbours of the middle pin; a short
+        // 0.25 mm piece can
+        let mut s = String::from(HEAD);
+        for (k, net) in ["X", "P", "Y"].iter().enumerate() {
+            s += &smd(&format!("U{}", k), net, 10.0 + 0.65 * k as f64, 5.0, 0.35, 1.4);
+        }
+        s += &smd("C", "P", 10.65, 12.0, 2.0, 2.0);
+        s += "(gr_rect (start 0 0) (end 22 16) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let wide = Options {
+            track_width: Some(1.2),
+            ..Options::default()
+        };
+        let r = route(&b, &rules(), &wide);
+        assert!(r.complete(), "{:?}", r.nets);
+        assert_eq!(r.nets[0].necked.len(), 1, "{:?}", r.nets[0].necked);
+        assert!(r.tracks.iter().any(|t| (t.width - 0.25).abs() < 1e-9));
+        assert!(r.tracks.iter().any(|t| (t.width - 1.2).abs() < 1e-9));
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        assert!(kicad_joined(&b, &r, "P"));
+        // and without narrowing, the pad is reported, not forced
+        let stiff = route(
+            &b,
+            &rules(),
+            &Options {
+                neck_length: 0.0,
+                ..wide
+            },
+        );
+        assert!(!stiff.complete());
+        assert!(smallest_gap(&b, &stiff) >= 0.2 - 1e-6);
+    }
+
+    #[test]
+    fn a_kept_fan_out_is_joined_at_its_loose_end() {
+        // a locked stub leads away from pad A: the new track must end on the stub's end,
+        // not start again at the pad and leave the stub dangling
+        let s = String::from(HEAD)
+            + &smd("A", "N", 3.0, 5.0, 1.0, 1.0)
+            + &smd("B", "N", 17.0, 5.0, 1.0, 1.0)
+            + "(segment (start 3 5) (end 3 8) (width 0.25) (locked yes) (layer \"F.Cu\") (net \"N\"))\n"
+            + "(gr_rect (start 0 0) (end 20 12) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        let at_end = |p: P| geom::dist(p, (3.0, 8.0)) < 1e-6;
+        assert!(
+            r.tracks.iter().any(|t| at_end(t.a) || at_end(t.b)),
+            "no track ends on the stub's end"
+        );
+        assert!(!r
+            .tracks
+            .iter()
+            .any(|t| geom::dist(t.a, (3.0, 5.0)) < 1e-6 || geom::dist(t.b, (3.0, 5.0)) < 1e-6));
+    }
+
+    #[test]
+    fn copper_keeps_the_hole_clearance_from_a_plain_hole() {
+        // the board asks 0.4 mm from holes, more than the 0.2 mm between copper
+        let s = String::from(HEAD)
+            + &smd("A", "N", 2.0, 5.0, 1.0, 1.0)
+            + &smd("B", "N", 18.0, 5.0, 1.0, 1.0)
+            + "(footprint \"H\" (at 10 5) (property \"Reference\" \"H1\") (pad \"\" np_thru_hole circle (at 0 0) (size 2 2) (drill 2) (layers \"*.Cu\" \"*.Mask\")))\n"
+            + "(gr_rect (start 0 2) (end 20 8) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let mut rules = rules();
+        rules.hole_clearance = 0.4;
+        let r = route(&b, &rules, &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        for t in &r.tracks {
+            let d = geom::seg_shape_dist(t.a, t.b, &b.holes[0]) - t.width / 2.0;
+            assert!(d >= 0.4 - 1e-6, "a track passes {:.3} mm from the hole", d);
+        }
+    }
+
+    #[test]
+    fn inner_planes_are_left_whole() {
+        // four layers, In1 a GND plane: the crossing nets may use F, In2 and B, not In1
+        let mut s = String::from(
+            "(kicad_pcb (version 20260206) (layers (0 \"F.Cu\" signal) (4 \"In1.Cu\" signal) (6 \"In2.Cu\" signal) (2 \"B.Cu\" signal) (25 \"Edge.Cuts\" user))\n",
+        );
+        for (k, (net, x, y)) in [("H", 1.0, 10.0), ("H", 29.0, 10.0), ("V", 15.0, 1.0), ("V", 15.0, 19.0)]
+            .iter()
+            .enumerate()
+        {
+            s += &smd(&format!("J{}", k), net, *x, *y, 0.8, 0.8);
+        }
+        s += "(zone (net \"GND\") (layer \"In1.Cu\") (polygon (pts (xy 0.5 0.5) (xy 29.5 0.5) (xy 29.5 19.5) (xy 0.5 19.5))))\n";
+        s += "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        assert_eq!(plane_layers(&b), vec![1]);
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(r.tracks.iter().all(|t| t.layer != 1), "a track was laid on the plane");
+        assert!(!r.vias.is_empty());
     }
 
     #[test]

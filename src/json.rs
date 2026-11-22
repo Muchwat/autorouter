@@ -58,6 +58,25 @@ impl Json {
     }
 }
 
+/// A string as JSON text, quotes included.
+pub fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn parse(text: &str) -> Result<Json, String> {
     let b = text.as_bytes();
     let mut p = 0;
@@ -192,6 +211,12 @@ fn value(b: &[u8], p: &mut usize) -> Result<Json, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_round_trips() {
+        let s = "a \"b\" \\ c\n\td \u{1} é";
+        assert_eq!(parse(&quote(s)).unwrap().as_str(), Some(s));
+    }
 
     #[test]
     fn reads_a_project_fragment() {

@@ -57,6 +57,9 @@ pub struct Zone {
     pub outline: Vec<P>,
     /// Some for a rule area (keep-out).
     pub keepout: Option<Keepout>,
+    /// The zone's own clearance to other nets' copper, and the least width of its copper.
+    pub clearance: f64,
+    pub min_thickness: f64,
 }
 
 /// How the file names a net inside an item.
@@ -517,6 +520,11 @@ impl Board {
             layers,
             outline,
             keepout,
+            clearance: z
+                .get("connect_pads")
+                .and_then(|c| c.child_num("clearance"))
+                .unwrap_or(0.0),
+            min_thickness: z.child_num("min_thickness").unwrap_or(0.25),
         });
     }
 

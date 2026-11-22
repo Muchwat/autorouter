@@ -132,6 +132,10 @@ pub struct Rules {
     patterns: Vec<(String, String)>,
     pub min_clearance: f64,
     pub edge_clearance: f64,
+    /// The least gap between the edges of two drilled holes.
+    pub hole_to_hole: f64,
+    /// The least gap between a hole's edge and other copper.
+    pub hole_clearance: f64,
     pub rules: Vec<Rule>,
     courtyards: BTreeMap<String, (f64, f64, f64, f64)>,
     /// Things worth telling the user (a rule part this router cannot read, say).
@@ -152,6 +156,8 @@ impl Default for Rules {
             patterns: Vec::new(),
             min_clearance: 0.0,
             edge_clearance: 0.5,
+            hole_to_hole: 0.25,
+            hole_clearance: 0.25,
             rules: Vec::new(),
             courtyards: BTreeMap::new(),
             notes: Vec::new(),
@@ -161,6 +167,9 @@ impl Default for Rules {
 
 /// KiCad's wildcard match: `*` any run, `?` any one character.
 pub fn wildcard(pattern: &str, s: &str) -> bool {
+    if !pattern.contains(['*', '?']) {
+        return pattern == s; // the usual case, with nothing to allocate
+    }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = s.chars().collect();
     let (mut i, mut j, mut star, mut mark) = (0usize, 0usize, None, 0usize);
@@ -227,6 +236,12 @@ impl Rules {
             }
             if let Some(v) = rules.get("min_copper_edge_clearance").and_then(Json::as_f64) {
                 self.edge_clearance = v;
+            }
+            if let Some(v) = rules.get("min_hole_to_hole").and_then(Json::as_f64) {
+                self.hole_to_hole = v;
+            }
+            if let Some(v) = rules.get("min_hole_clearance").and_then(Json::as_f64) {
+                self.hole_clearance = v;
             }
         }
         if let Some(ns) = j.get("net_settings") {
@@ -372,17 +387,17 @@ impl Rules {
     }
 
     pub fn class_of(&self, net: &str) -> &NetClass {
-        let name = self.assignments.get(net).cloned().or_else(|| {
+        let name: Option<&str> = self.assignments.get(net).map(|s| s.as_str()).or_else(|| {
             self.patterns
                 .iter()
                 .find(|(p, _)| p == net || wildcard(p, net))
-                .map(|(_, c)| c.clone())
+                .map(|(_, c)| c.as_str())
         });
         name.and_then(|n| self.classes.iter().find(|c| c.name == n))
             .unwrap_or(&self.classes[0])
     }
 
-    fn eval(&self, e: &Expr, a: &Item, b: &Item) -> T {
+    fn eval<'v>(&'v self, e: &'v Expr, a: &Item<'v>, b: &Item<'v>) -> T {
         match e {
             Expr::Or(x, y) => or(self.eval(x, a, b), self.eval(y, a, b)),
             Expr::And(x, y) => and(self.eval(x, a, b), self.eval(y, a, b)),
@@ -454,17 +469,25 @@ impl Rules {
         }
     }
 
-    fn value(&self, v: &Val, a: &Item, b: &Item) -> Option<String> {
+    /// The text a value stands for, borrowed where it can be (this runs for
+    /// every comparison of every rule, so it must not copy strings).
+    fn value<'v>(&'v self, v: &'v Val, a: &Item<'v>, b: &Item<'v>) -> Option<std::borrow::Cow<'v, str>> {
+        use std::borrow::Cow;
         match v {
-            Val::Str(s) => Some(s.clone()),
-            Val::Num(n) => Some(n.to_string()),
+            Val::Str(s) => Some(Cow::Borrowed(s.as_str())),
+            Val::Num(n) => Some(Cow::Owned(n.to_string())),
             Val::Prop(side, prop) => {
                 let it = if *side == 'A' { a } else { b };
-                match prop.to_ascii_lowercase().as_str() {
-                    "netname" => Some(it.net.unwrap_or("").to_string()),
-                    "netclass" | "net_class" => Some(it.net.map(|n| self.class_of(n).name.clone()).unwrap_or_default()),
-                    "type" => it.kind.map(|k| k.to_string()),
-                    _ => None,
+                if prop.eq_ignore_ascii_case("netname") {
+                    Some(Cow::Borrowed(it.net.unwrap_or("")))
+                } else if prop.eq_ignore_ascii_case("netclass") || prop.eq_ignore_ascii_case("net_class") {
+                    Some(Cow::Borrowed(
+                        it.net.map(|n| self.class_of(n).name.as_str()).unwrap_or(""),
+                    ))
+                } else if prop.eq_ignore_ascii_case("type") {
+                    it.kind.map(Cow::Borrowed)
+                } else {
+                    None
                 }
             }
         }
@@ -551,6 +574,68 @@ impl Rules {
             }
         }
         width.min(cap).max(floor)
+    }
+
+    /// What the rules' tests of place say of a shape: one bit for each
+    /// courtyard a rule names, set when the shape is in it. Two items of the
+    /// same net and kind with the same answer here are owed the same clearance,
+    /// so the answer can stand in for the shape when clearances are remembered.
+    pub fn place(&self, shape: &Shape) -> u64 {
+        let mut calls: Vec<(&str, &str)> = Vec::new();
+        for r in &self.rules {
+            if let Some(e) = &r.condition {
+                yard_calls(e, &mut calls);
+            }
+        }
+        calls.sort();
+        calls.dedup();
+        let (x0, y0, x1, y1) = shape.bbox();
+        let mut bits = 0u64;
+        for (k, (func, target)) in calls.iter().take(64).enumerate() {
+            let hit = self
+                .courtyards
+                .iter()
+                .filter(|(r, _)| wildcard(target, r))
+                .any(|(_, c)| {
+                    if *func == "insideCourtyard" {
+                        x0 >= c.0 && y0 >= c.1 && x1 <= c.2 && y1 <= c.3
+                    } else {
+                        !(x1 < c.0 || x0 > c.2 || y1 < c.1 || y0 > c.3)
+                    }
+                });
+            if hit {
+                bits |= 1 << k;
+            }
+        }
+        bits
+    }
+
+    /// Whether clearances may be remembered by net, kind and `place()`: not
+    /// when the rules name more courtyards than `place()` has bits for.
+    pub fn place_is_whole(&self) -> bool {
+        let mut calls: Vec<(&str, &str)> = Vec::new();
+        for r in &self.rules {
+            if let Some(e) = &r.condition {
+                yard_calls(e, &mut calls);
+            }
+        }
+        calls.sort();
+        calls.dedup();
+        calls.len() <= 64
+    }
+
+    /// The least width the rules allow this net's tracks (0 when no rule says).
+    pub fn track_floor(&self, net: &str) -> f64 {
+        let it = Item::track(net);
+        let mut floor = 0.0f64;
+        for rule in &self.rules {
+            for c in rule.constraints.iter().filter(|c| c.kind == Kind::TrackWidth) {
+                if let (Some(v), true) = (c.min, self.applies(rule, &it, &it, false) != T::No) {
+                    floor = floor.max(v);
+                }
+            }
+        }
+        floor
     }
 
     /// The smallest copper clearance any rule or class asks for: a lower bound
@@ -794,6 +879,21 @@ fn parse_expr(s: &str) -> Expr {
         return Expr::Unknown;
     }
     e
+}
+
+/// The courtyard tests in a condition: (function, footprint named).
+fn yard_calls<'a>(e: &'a Expr, out: &mut Vec<(&'a str, &'a str)>) {
+    match e {
+        Expr::Or(a, b) | Expr::And(a, b) => {
+            yard_calls(a, out);
+            yard_calls(b, out);
+        }
+        Expr::Not(a) => yard_calls(a, out),
+        Expr::Call(_, func, args) if func.ends_with("Courtyard") => {
+            out.push((func.as_str(), args.first().map(|s| s.as_str()).unwrap_or("")));
+        }
+        _ => {}
+    }
 }
 
 fn literals<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {

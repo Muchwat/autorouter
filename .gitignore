@@ -1,2 +1,5 @@
 /target
 *.rpt
+bench/boards.txt
+bench/results.json
+bench/widths/

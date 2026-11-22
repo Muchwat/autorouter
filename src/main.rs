@@ -2,6 +2,7 @@ use autorouter::board::Board;
 use autorouter::router::{self, Options};
 use autorouter::rules::Rules;
 use autorouter::write;
+use autorouter::{json, pour};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::time::Instant;
@@ -23,8 +24,16 @@ usage: autorouter BOARD.kicad_pcb [options]
                          raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
       --via D/DRILL      one via size for every net, e.g. 0.6/0.3 (default: from the rules)
+      --tracks-on-planes also lay tracks on inner layers that a pour covers (by default
+                         such a layer is kept as a whole plane)
       --no-vias          route without vias
       --via-in-pad       let vias sit on surface-mount pads of their own net
+      --neck MM          width a track narrows to where it is too wide to reach a pad
+                         (default: the Default class's width, or the rules' minimum if more)
+      --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
+      --double-vias MM   tracks this wide or wider get a second via beside each via
+                         (default 0.8; 0: never)
+      --report FILE      write what was done as JSON (for scripts and benchmarks)
       --via-cost N       what a via costs, in grid steps (default 12)
       --passes N         most negotiation passes (default 40)
       --drc              refill the zones and check the result with KiCad's DRC (kicad-cli),
@@ -169,6 +178,7 @@ fn main() {
     };
     let (mut input, mut output, mut rip, mut check, mut quiet, mut keep_fills) =
         (None::<PathBuf>, None::<PathBuf>, false, false, false, false);
+    let mut report: Option<PathBuf> = None;
     let mut layer_names: Option<Vec<String>> = None;
     let mut i = 0;
     let value = |i: &mut usize, name: &str| -> String {
@@ -203,7 +213,24 @@ fn main() {
                 opt.via = Some((mm(d, "--via"), mm(h, "--via")));
             }
             "--no-vias" => opt.no_vias = true,
+            "--tracks-on-planes" => opt.tracks_on_planes = true,
             "--via-in-pad" => opt.via_in_pad = true,
+            "--neck" => opt.neck = Some(mm(&value(&mut i, &a), &a)),
+            "--report" => report = Some(PathBuf::from(value(&mut i, &a))),
+            "--double-vias" => {
+                opt.double_vias = value(&mut i, &a)
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|m| *m >= 0.0)
+                    .unwrap_or_else(|| die("--double-vias needs a width in millimetres, 0 or more"))
+            }
+            "--neck-length" => {
+                opt.neck_length = value(&mut i, &a)
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|m| *m >= 0.0)
+                    .unwrap_or_else(|| die("--neck-length needs a number of millimetres, 0 or more"))
+            }
             "--keep-fills" => keep_fills = true,
             "--via-cost" => {
                 opt.via_cost = value(&mut i, &a)
@@ -331,7 +358,58 @@ fn main() {
             n.unrouted.join(", ")
         );
     }
+    let necked: Vec<String> = result
+        .nets
+        .iter()
+        .flat_map(|n| {
+            n.necked
+                .iter()
+                .map(move |(pad, w)| format!("{} at {} ({} mm, not {} mm)", n.net, pad, w, n.width))
+        })
+        .collect();
+    if !necked.is_empty() {
+        println!("  narrowed to reach {} pad(s): {}", necked.len(), necked.join("; "));
+    }
+    if result.doubled > 0 || !result.single.is_empty() {
+        println!(
+            "  second vias beside the vias of wide tracks: {} added{}",
+            result.doubled,
+            if result.single.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; no room at {} ({})",
+                    result.single.len(),
+                    result
+                        .single
+                        .iter()
+                        .take(6)
+                        .map(|(n, p)| format!("{} at {:.2}, {:.2}", n, p.0, p.1))
+                        .collect::<Vec<String>>()
+                        .join("; ")
+                )
+            }
+        );
+    }
+    // pours the new copper may have cut (an estimate on the grid; KiCad's fill decides)
+    let cuts = if changed {
+        pour::cuts(&board, &rules, &result, opt.grid, None)
+    } else {
+        Vec::new()
+    };
+    for c in &cuts {
+        println!(
+            "  WARNING the {} pour looks cut by the new tracks: {} of {} pads off the main piece ({}{}). \
+             Check with --drc; stitching vias or --include-poured can join them",
+            c.net,
+            c.cut_off.len(),
+            c.pads,
+            c.cut_off.iter().take(8).cloned().collect::<Vec<String>>().join(", "),
+            if c.cut_off.len() > 8 { ", ..." } else { "" }
+        );
+    }
     let mut status = if left.is_empty() { 0 } else { 1 };
+    let mut drc_counts: Option<(usize, usize)> = None;
     if check {
         match drc(&output, &input) {
             Ok(d) => {
@@ -348,6 +426,7 @@ fn main() {
                 if !poured && !stale.is_empty() {
                     println!("  zone fills were removed from the output: pour them again in KiCad (B)");
                 }
+                drc_counts = Some((d.errors, d.unconnected));
                 if d.errors > 0 || d.unconnected > 0 {
                     status = 1;
                 }
@@ -364,6 +443,71 @@ fn main() {
         );
     } else if changed && keep_fills && !board.fills.is_empty() {
         println!("  the zones' old fills were kept: they overlap the new copper until poured again in KiCad (B)");
+    }
+    if let Some(path) = report {
+        let q = json::quote;
+        let list = |v: Vec<String>| format!("[{}]", v.join(", "));
+        let track_mm: f64 = result
+            .tracks
+            .iter()
+            .map(|t| ((t.a.0 - t.b.0).powi(2) + (t.a.1 - t.b.1).powi(2)).sqrt())
+            .sum();
+        let text = format!(
+            "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
+             \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \
+             \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
+             \"narrowed\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
+            q(env!("CARGO_PKG_VERSION")),
+            q(&input.display().to_string()),
+            q(&output.display().to_string()),
+            secs,
+            result.passes,
+            result.nets.len(),
+            result.nets.len() - left.len(),
+            result.tracks.len(),
+            track_mm,
+            result.vias.len(),
+            result.doubled,
+            result.single.len(),
+            removed,
+            list(left
+                .iter()
+                .map(|n| format!(
+                    "{{\"net\": {}, \"pieces\": {}, \"left\": {}}}",
+                    q(&n.net),
+                    n.pieces,
+                    list(n.unrouted.iter().map(|u| q(u)).collect())
+                ))
+                .collect()),
+            list(result
+                .nets
+                .iter()
+                .flat_map(|n| n.necked.iter().map(move |(pad, w)| format!(
+                    "{{\"net\": {}, \"pad\": {}, \"width\": {}}}",
+                    q(&n.net),
+                    q(pad),
+                    w
+                )))
+                .collect()),
+            list(cuts
+                .iter()
+                .map(|c| format!(
+                    "{{\"net\": {}, \"pads\": {}, \"cut_off\": {}}}",
+                    q(&c.net),
+                    c.pads,
+                    list(c.cut_off.iter().map(|u| q(u)).collect())
+                ))
+                .collect()),
+            list(result.warnings.iter().map(|w| q(w)).collect()),
+            match drc_counts {
+                Some((e, u)) => format!("{{\"errors\": {}, \"unconnected\": {}}}", e, u),
+                None => "null".to_string(),
+            }
+        );
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("autorouter: cannot write {}: {}", path.display(), e);
+            status = 2;
+        }
     }
     exit(status);
 }

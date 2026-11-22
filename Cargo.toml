@@ -1,6 +1,6 @@
 [package]
 name = "autorouter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A grid autorouter for KiCad boards: negotiated congestion, per-net-pair clearance from KiCad's own rules"
 license = "MIT OR Apache-2.0"
@@ -12,6 +12,10 @@ categories = ["command-line-utilities", "science"]
 [[bin]]
 name = "autorouter"
 path = "src/main.rs"
+
+[[bin]]
+name = "autorouter-bench"
+path = "src/bin/bench.rs"
 
 [lib]
 name = "autorouter"

@@ -1,0 +1,3 @@
+# one board per line: its path (relative to this file, or absolute), then autorouter options
+# ../../my-project/hardware/my-board.kicad_pcb
+# ../../other/power-board.kicad_pcb --grid 0.254 --include-poured --skip /MAINS_L,/MAINS_N
