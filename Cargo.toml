@@ -1,0 +1,25 @@
+[package]
+name = "autorouter"
+version = "0.1.0"
+edition = "2021"
+description = "A grid autorouter for KiCad boards: negotiated congestion, per-net-pair clearance from KiCad's own rules"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Muchwat/autorouter"
+readme = "README.md"
+keywords = ["kicad", "pcb", "autorouter", "eda"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "autorouter"
+path = "src/main.rs"
+
+[lib]
+name = "autorouter"
+path = "src/lib.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

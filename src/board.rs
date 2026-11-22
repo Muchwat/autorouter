@@ -1,0 +1,629 @@
+//! What the router needs from a `.kicad_pcb`: copper layers, nets, pads,
+//! tracks, vias, zones and the board outline. KiCad 7 to 10 files.
+
+use crate::geom::{self, rot, Shape, P};
+use crate::sexpr::{self, Node};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug)]
+pub struct Pad {
+    pub reference: String,
+    pub number: String,
+    pub net: Option<String>,
+    pub shape: Shape,
+    /// Copper layer indices (into Board::copper).
+    pub layers: Vec<usize>,
+    pub through: bool,
+}
+
+impl Pad {
+    pub fn name(&self) -> String {
+        format!("{}.{}", self.reference, self.number)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Track {
+    pub net: Option<String>,
+    pub layer: usize,
+    pub a: P,
+    pub b: P,
+    pub width: f64,
+    pub locked: bool,
+    /// Byte range of the item in the file; several segments share one arc's range.
+    pub span: (usize, usize),
+}
+
+#[derive(Clone, Debug)]
+pub struct Via {
+    pub net: Option<String>,
+    pub at: P,
+    pub diameter: f64,
+    pub drill: f64,
+    pub locked: bool,
+    pub span: (usize, usize),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Keepout {
+    pub tracks: bool,
+    pub vias: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Zone {
+    pub net: Option<String>,
+    pub layers: Vec<usize>,
+    pub outline: Vec<P>,
+    /// Some for a rule area (keep-out).
+    pub keepout: Option<Keepout>,
+}
+
+/// How the file names a net inside an item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NetStyle {
+    /// KiCad 10: `(net "GND")`
+    Name,
+    /// KiCad 7 to 9: `(net 3)`, with a `(net 3 "GND")` table at the top
+    Code,
+}
+
+#[derive(Clone, Debug)]
+pub struct Board {
+    pub text: String,
+    pub version: u64,
+    pub copper: Vec<String>,
+    pub style: NetStyle,
+    pub net_codes: BTreeMap<String, i64>,
+    pub pads: Vec<Pad>,
+    pub tracks: Vec<Track>,
+    pub vias: Vec<Via>,
+    pub zones: Vec<Zone>,
+    /// Non-plated holes: (centre, radius).
+    pub holes: Vec<(P, f64)>,
+    /// The outline (Edge.Cuts), as zero-width segments.
+    pub edges: Vec<(P, P)>,
+    /// Footprint courtyards, for rules that ask about them: reference -> bbox.
+    pub courtyards: BTreeMap<String, (f64, f64, f64, f64)>,
+    /// Byte offset of the file's closing parenthesis, where new items go.
+    pub end: usize,
+}
+
+fn xy(n: &Node) -> Option<P> {
+    Some((n.num(0)?, n.num(1)?))
+}
+
+fn layer_order(name: &str) -> i64 {
+    match name {
+        "F.Cu" => 0,
+        "B.Cu" => 10_000,
+        _ => name
+            .trim_start_matches("In")
+            .trim_end_matches(".Cu")
+            .parse::<i64>()
+            .unwrap_or(5_000),
+    }
+}
+
+impl Board {
+    pub fn parse(text: String) -> Result<Board, String> {
+        let root = sexpr::parse(&text).map_err(|e| e.to_string())?;
+        if root.head() != Some("kicad_pcb") {
+            return Err("not a KiCad board (no kicad_pcb at the top)".into());
+        }
+        let version = root.child_num("version").unwrap_or(0.0) as u64;
+        let mut copper: Vec<String> = root
+            .get("layers")
+            .map(|l| {
+                l.items()
+                    .iter()
+                    .filter_map(|n| n.arg(0))
+                    .filter(|name| name.ends_with(".Cu"))
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        copper.sort_by_key(|n| layer_order(n));
+        if copper.is_empty() {
+            return Err("the board has no copper layers".into());
+        }
+
+        let mut net_codes = BTreeMap::new();
+        let mut code_names = BTreeMap::new();
+        for n in root.all("net") {
+            if let (Some(code), Some(name)) = (n.num(0), n.arg(1)) {
+                net_codes.insert(name.to_string(), code as i64);
+                code_names.insert(code as i64, name.to_string());
+            }
+        }
+        let style = if net_codes.is_empty() {
+            NetStyle::Name
+        } else {
+            NetStyle::Code
+        };
+        let net_of = |n: &Node| -> Option<String> {
+            let net = n.get("net")?;
+            let name = match (net.items().len(), style) {
+                // (net 3 "GND") in a pad, (net "GND") in KiCad 10, (net 3) in an item of a coded file
+                (3, _) => net.arg(1).map(|s| s.to_string()),
+                (2, NetStyle::Code) => net.num(0).and_then(|c| code_names.get(&(c as i64)).cloned()),
+                (2, NetStyle::Name) => net.arg(0).map(|s| s.to_string()),
+                _ => None,
+            }
+            .or_else(|| n.child_text("net_name").map(|s| s.to_string()))?;
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
+        };
+        let layer_list = |n: &Node| -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            if let Some(l) = n.get("layers") {
+                names.extend(l.args().iter().map(|s| s.to_string()));
+            }
+            if let Some(l) = n.get("layer") {
+                names.extend(l.args().iter().map(|s| s.to_string()));
+            }
+            for name in names {
+                match name.as_str() {
+                    "*.Cu" => out.extend(0..copper.len()),
+                    "F&B.Cu" => {
+                        out.push(0);
+                        out.push(copper.len() - 1);
+                    }
+                    other => {
+                        if let Some(i) = copper.iter().position(|c| c == other) {
+                            out.push(i);
+                        }
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        };
+
+        let mut b = Board {
+            version,
+            copper: copper.clone(),
+            style,
+            net_codes: net_codes.clone(),
+            pads: Vec::new(),
+            tracks: Vec::new(),
+            vias: Vec::new(),
+            zones: Vec::new(),
+            holes: Vec::new(),
+            edges: Vec::new(),
+            courtyards: BTreeMap::new(),
+            end: root.span().map(|s| s.1 - 1).unwrap_or(text.len()),
+            text: String::new(),
+        };
+
+        for item in root.items() {
+            match item.head() {
+                Some("footprint") | Some("module") => b.footprint(item, &net_of, &layer_list),
+                Some("segment") => {
+                    let layer = layer_list(item);
+                    if let (Some(s), Some(e), Some(&l)) = (
+                        item.get("start").and_then(xy),
+                        item.get("end").and_then(xy),
+                        layer.first(),
+                    ) {
+                        b.tracks.push(Track {
+                            net: net_of(item),
+                            layer: l,
+                            a: s,
+                            b: e,
+                            width: item.child_num("width").unwrap_or(0.25),
+                            locked: item.flag("locked"),
+                            span: item.span().unwrap(),
+                        });
+                    }
+                }
+                Some("arc") => {
+                    let layer = layer_list(item);
+                    let pts = (
+                        item.get("start").and_then(xy),
+                        item.get("mid").and_then(xy),
+                        item.get("end").and_then(xy),
+                    );
+                    if let ((Some(s), Some(m), Some(e)), Some(&l)) = (pts, layer.first()) {
+                        let pts = geom::arc_points(s, m, e, 0.2);
+                        for w in pts.windows(2) {
+                            b.tracks.push(Track {
+                                net: net_of(item),
+                                layer: l,
+                                a: w[0],
+                                b: w[1],
+                                width: item.child_num("width").unwrap_or(0.25),
+                                locked: item.flag("locked"),
+                                span: item.span().unwrap(),
+                            });
+                        }
+                    }
+                }
+                Some("via") => {
+                    if let Some(at) = item.get("at").and_then(xy) {
+                        b.vias.push(Via {
+                            net: net_of(item),
+                            at,
+                            diameter: item.child_num("size").unwrap_or(0.8),
+                            drill: item.child_num("drill").unwrap_or(0.4),
+                            locked: item.flag("locked"),
+                            span: item.span().unwrap(),
+                        });
+                    }
+                }
+                Some("zone") => b.zone(item, &net_of, &layer_list),
+                Some(h) if h.starts_with("gr_") && item.child_text("layer") == Some("Edge.Cuts") => {
+                    b.edge_item(item, (0.0, 0.0), 0.0);
+                }
+                _ => {}
+            }
+        }
+        b.text = text;
+        Ok(b)
+    }
+
+    fn footprint(
+        &mut self,
+        fp: &Node,
+        net_of: &dyn Fn(&Node) -> Option<String>,
+        layer_list: &dyn Fn(&Node) -> Vec<usize>,
+    ) {
+        let at = fp.get("at");
+        let origin = at.and_then(xy).unwrap_or((0.0, 0.0));
+        let fdeg = at.and_then(|a| a.num(2)).unwrap_or(0.0);
+        let reference = fp
+            .all("property")
+            .find(|p| p.arg(0) == Some("Reference"))
+            .and_then(|p| p.arg(1))
+            .or_else(|| {
+                fp.all("fp_text")
+                    .find(|t| t.arg(0) == Some("reference"))
+                    .and_then(|t| t.arg(1))
+            })
+            .unwrap_or("")
+            .to_string();
+        let place = |p: P| geom::add(origin, rot(p, fdeg));
+        let mut court: Option<(f64, f64, f64, f64)> = None;
+        for item in fp.items() {
+            match item.head() {
+                Some("pad") => self.pad(
+                    item,
+                    &reference,
+                    place(item.get("at").and_then(xy).unwrap_or((0.0, 0.0))),
+                    net_of,
+                    layer_list,
+                ),
+                Some("zone") => self.zone(item, net_of, layer_list),
+                Some(h) if h.starts_with("fp_") => {
+                    let layer = item.child_text("layer").unwrap_or("");
+                    if layer == "Edge.Cuts" {
+                        self.edge_item(item, origin, fdeg);
+                    }
+                    if layer == "F.CrtYd" || layer == "B.CrtYd" {
+                        for key in ["start", "end", "center", "mid"] {
+                            if let Some(p) = item.get(key).and_then(xy) {
+                                let q = place(p);
+                                court = Some(match court {
+                                    None => (q.0, q.1, q.0, q.1),
+                                    Some(c) => (c.0.min(q.0), c.1.min(q.1), c.2.max(q.0), c.3.max(q.1)),
+                                });
+                            }
+                        }
+                        if let Some(pts) = item.get("pts") {
+                            for p in pts.all("xy").filter_map(xy) {
+                                let q = place(p);
+                                court = Some(match court {
+                                    None => (q.0, q.1, q.0, q.1),
+                                    Some(c) => (c.0.min(q.0), c.1.min(q.1), c.2.max(q.0), c.3.max(q.1)),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(c) = court {
+            if !reference.is_empty() {
+                self.courtyards.insert(reference, c);
+            }
+        }
+    }
+
+    fn pad(
+        &mut self,
+        pad: &Node,
+        reference: &str,
+        pos: P,
+        net_of: &dyn Fn(&Node) -> Option<String>,
+        layer_list: &dyn Fn(&Node) -> Vec<usize>,
+    ) {
+        let kind = pad.arg(1).unwrap_or("smd");
+        let form = pad.arg(2).unwrap_or("rect");
+        // the pad's angle in a board file is its total angle, footprint's included
+        let deg = pad.get("at").and_then(|a| a.num(2)).unwrap_or(0.0);
+        let size = pad.get("size").and_then(xy).unwrap_or((1.0, 1.0));
+        let drill = pad.get("drill");
+        let drill_d = drill.and_then(|d| d.num(0).or_else(|| d.num(1)));
+        if kind == "np_thru_hole" {
+            let r = drill_d.unwrap_or(size.0.min(size.1)) / 2.0;
+            self.holes.push((pos, r));
+            return;
+        }
+        let offset = drill.and_then(|d| d.get("offset")).and_then(xy).unwrap_or((0.0, 0.0));
+        let c = geom::add(pos, rot(offset, deg));
+        let (w, h) = size;
+        let shape = match form {
+            "circle" => Shape::Circle { c, r: w / 2.0 },
+            "oval" => {
+                if (w - h).abs() < 1e-9 {
+                    Shape::Circle { c, r: w / 2.0 }
+                } else if w > h {
+                    let d = rot(((w - h) / 2.0, 0.0), deg);
+                    Shape::Capsule {
+                        a: (c.0 - d.0, c.1 - d.1),
+                        b: (c.0 + d.0, c.1 + d.1),
+                        r: h / 2.0,
+                    }
+                } else {
+                    let d = rot((0.0, (h - w) / 2.0), deg);
+                    Shape::Capsule {
+                        a: (c.0 - d.0, c.1 - d.1),
+                        b: (c.0 + d.0, c.1 + d.1),
+                        r: w / 2.0,
+                    }
+                }
+            }
+            "roundrect" => {
+                let ratio = pad.child_num("roundrect_rratio").unwrap_or(0.25);
+                Shape::Box {
+                    c,
+                    hw: w / 2.0,
+                    hh: h / 2.0,
+                    deg,
+                    r: ratio * w.min(h),
+                }
+            }
+            "trapezoid" => {
+                let d = pad.get("rect_delta").and_then(xy).unwrap_or((0.0, 0.0));
+                Shape::Box {
+                    c,
+                    hw: (w + d.1.abs()) / 2.0,
+                    hh: (h + d.0.abs()) / 2.0,
+                    deg,
+                    r: 0.0,
+                }
+            }
+            "custom" => {
+                // the anchor plus the bounding box of the primitives, in the pad's own frame
+                let (mut x0, mut y0, mut x1, mut y1) = (-w / 2.0, -h / 2.0, w / 2.0, h / 2.0);
+                if let Some(prims) = pad.get("primitives") {
+                    for p in prims.items().iter().skip(1) {
+                        let width = p.child_num("width").unwrap_or(0.0) / 2.0;
+                        let mut pts: Vec<P> = Vec::new();
+                        for key in ["start", "end", "center", "mid"] {
+                            if let Some(q) = p.get(key).and_then(xy) {
+                                pts.push(q);
+                            }
+                        }
+                        if p.head() == Some("gr_circle") {
+                            if let (Some(cc), Some(e)) = (p.get("center").and_then(xy), p.get("end").and_then(xy)) {
+                                let r = geom::dist(cc, e);
+                                pts.push((cc.0 - r, cc.1 - r));
+                                pts.push((cc.0 + r, cc.1 + r));
+                            }
+                        }
+                        if let Some(ps) = p.get("pts") {
+                            pts.extend(ps.all("xy").filter_map(xy));
+                        }
+                        for q in pts {
+                            x0 = x0.min(q.0 - width);
+                            y0 = y0.min(q.1 - width);
+                            x1 = x1.max(q.0 + width);
+                            y1 = y1.max(q.1 + width);
+                        }
+                    }
+                }
+                let mid = rot(((x0 + x1) / 2.0, (y0 + y1) / 2.0), deg);
+                Shape::Box {
+                    c: geom::add(c, mid),
+                    hw: (x1 - x0) / 2.0,
+                    hh: (y1 - y0) / 2.0,
+                    deg,
+                    r: 0.0,
+                }
+            }
+            _ => Shape::Box {
+                c,
+                hw: w / 2.0,
+                hh: h / 2.0,
+                deg,
+                r: 0.0,
+            },
+        };
+        let layers = layer_list(pad);
+        if layers.is_empty() {
+            return; // a pad on no copper layer (a paste or mask aperture)
+        }
+        self.pads.push(Pad {
+            reference: reference.to_string(),
+            number: pad.arg(0).unwrap_or("").to_string(),
+            net: net_of(pad),
+            shape,
+            layers,
+            through: kind == "thru_hole",
+        });
+    }
+
+    fn zone(&mut self, z: &Node, net_of: &dyn Fn(&Node) -> Option<String>, layer_list: &dyn Fn(&Node) -> Vec<usize>) {
+        let layers = layer_list(z);
+        let outline: Vec<P> = z
+            .get("polygon")
+            .and_then(|p| p.get("pts"))
+            .map(|pts| pts.all("xy").filter_map(xy).collect())
+            .unwrap_or_default();
+        if outline.len() < 3 || layers.is_empty() {
+            return;
+        }
+        let keepout = z.get("keepout").map(|k| Keepout {
+            tracks: k.child_text("tracks") == Some("not_allowed"),
+            vias: k.child_text("vias") == Some("not_allowed"),
+        });
+        if let Some(k) = &keepout {
+            if !k.tracks && !k.vias {
+                return; // a rule area that does not limit routing
+            }
+        }
+        self.zones.push(Zone {
+            net: net_of(z),
+            layers,
+            outline,
+            keepout,
+        });
+    }
+
+    fn edge_item(&mut self, item: &Node, origin: P, deg: f64) {
+        let place = |p: P| geom::add(origin, rot(p, deg));
+        let get = |k: &str| item.get(k).and_then(xy).map(&place);
+        let head = item.head().unwrap_or("");
+        let kind = head.trim_start_matches("gr_").trim_start_matches("fp_");
+        match kind {
+            "line" => {
+                if let (Some(a), Some(b)) = (get("start"), get("end")) {
+                    self.edges.push((a, b));
+                }
+            }
+            "arc" => {
+                if let (Some(s), Some(m), Some(e)) = (get("start"), get("mid"), get("end")) {
+                    let pts = geom::arc_points(s, m, e, 0.1);
+                    for w in pts.windows(2) {
+                        self.edges.push((w[0], w[1]));
+                    }
+                }
+            }
+            "circle" => {
+                if let (Some(c), Some(e)) = (get("center"), get("end")) {
+                    let r = geom::dist(c, e);
+                    let n = ((std::f64::consts::TAU * r / 0.1).ceil() as usize).max(12);
+                    let pts: Vec<P> = (0..=n)
+                        .map(|k| {
+                            let a = std::f64::consts::TAU * k as f64 / n as f64;
+                            (c.0 + r * a.cos(), c.1 + r * a.sin())
+                        })
+                        .collect();
+                    for w in pts.windows(2) {
+                        self.edges.push((w[0], w[1]));
+                    }
+                }
+            }
+            "rect" => {
+                if let (Some(a), Some(b)) = (item.get("start").and_then(xy), item.get("end").and_then(xy)) {
+                    let c = [a, (b.0, a.1), b, (a.0, b.1)].map(&place);
+                    for k in 0..4 {
+                        self.edges.push((c[k], c[(k + 1) % 4]));
+                    }
+                }
+            }
+            "poly" => {
+                if let Some(pts) = item.get("pts") {
+                    let p: Vec<P> = pts.all("xy").filter_map(xy).map(place).collect();
+                    for k in 0..p.len() {
+                        self.edges.push((p[k], p[(k + 1) % p.len()]));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The board's extent: the outline's bounding box, or every pad's when there is no outline.
+    pub fn extent(&self) -> Option<(f64, f64, f64, f64)> {
+        let mut bb: Option<(f64, f64, f64, f64)> = None;
+        let mut grow = |x0: f64, y0: f64, x1: f64, y1: f64| {
+            bb = Some(match bb {
+                None => (x0, y0, x1, y1),
+                Some(b) => (b.0.min(x0), b.1.min(y0), b.2.max(x1), b.3.max(y1)),
+            });
+        };
+        if !self.edges.is_empty() {
+            for (a, b) in &self.edges {
+                grow(a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+            }
+        } else {
+            for p in &self.pads {
+                let (x0, y0, x1, y1) = p.shape.bbox();
+                grow(x0, y0, x1, y1);
+            }
+        }
+        bb
+    }
+
+    /// Nets that have a copper pour (not a keep-out) on some layer.
+    pub fn poured_nets(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .zones
+            .iter()
+            .filter(|z| z.keepout.is_none())
+            .filter_map(|z| z.net.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KICAD10: &str = r#"(kicad_pcb (version 20260206)
+      (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+      (footprint "R" (layer "F.Cu") (at 10 10 90)
+        (property "Reference" "R1")
+        (pad "1" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 0.8) (layers "*.Cu" "*.Mask") (net "A"))
+        (pad "2" smd roundrect (at 2 0 90) (size 1 2) (layers "F.Cu" "F.Mask") (roundrect_rratio 0.25) (net "B")))
+      (segment (start 0 0) (end 1 0) (width 0.25) (layer "B.Cu") (net "A") (uuid "x"))
+      (via (at 5 5) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net "B"))
+      (zone (net "A") (layer "F.Cu") (polygon (pts (xy 0 0) (xy 20 0) (xy 20 20))))
+      (gr_rect (start 0 0) (end 20 20) (layer "Edge.Cuts"))
+    )"#;
+
+    #[test]
+    fn reads_a_kicad10_board() {
+        let b = Board::parse(KICAD10.to_string()).unwrap();
+        assert_eq!(b.copper, vec!["F.Cu", "B.Cu"]);
+        assert_eq!(b.style, NetStyle::Name);
+        assert_eq!(b.pads.len(), 2);
+        assert_eq!(b.pads[0].layers, vec![0, 1]);
+        assert_eq!(b.pads[1].layers, vec![0]);
+        // local (2, 0) in a footprint turned 90 degrees: (10, 8)
+        let c = b.pads[1].shape.centre();
+        assert!((c.0 - 10.0).abs() < 1e-9 && (c.1 - 8.0).abs() < 1e-9, "{:?}", c);
+        assert_eq!(b.tracks[0].net.as_deref(), Some("A"));
+        assert_eq!(b.tracks[0].layer, 1);
+        assert_eq!(b.vias[0].net.as_deref(), Some("B"));
+        assert_eq!(b.poured_nets(), vec!["A".to_string()]);
+        assert_eq!(b.edges.len(), 4);
+        assert_eq!(b.extent(), Some((0.0, 0.0, 20.0, 20.0)));
+    }
+
+    #[test]
+    fn reads_net_codes() {
+        let t = r#"(kicad_pcb (version 20240108) (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+          (net 0 "") (net 1 "GND")
+          (footprint "X" (at 0 0) (fp_text reference "U1" (at 0 0))
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+          (segment (start 0 0) (end 1 0) (width 0.25) (layer "F.Cu") (net 1)))"#;
+        let b = Board::parse(t.to_string()).unwrap();
+        assert_eq!(b.style, NetStyle::Code);
+        assert_eq!(b.pads[0].net.as_deref(), Some("GND"));
+        assert_eq!(b.pads[0].reference, "U1");
+        assert_eq!(b.tracks[0].net.as_deref(), Some("GND"));
+        assert_eq!(b.net_codes.get("GND"), Some(&1));
+    }
+}
