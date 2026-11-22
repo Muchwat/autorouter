@@ -36,6 +36,11 @@ usage: autorouter BOARD.kicad_pcb [options]
       --pair W/GAP       width of a pair's tracks and the gap between them, e.g. 0.2/0.15
                          (default: the net class's pair settings, else its track width
                          and the clearance between the two nets)
+      --skew MM          lengthen the shorter half of each pair until the two are within
+                         this of each other (default: a skew rule of the board, if any)
+      --match-length A,B bring these nets (wildcards) to the length of the longest of
+                         them, with meanders; may be given more than once, a group each
+      --meander MM       the tallest bump of a meander (default 1)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
@@ -221,6 +226,17 @@ fn main() {
             "--tracks-on-planes" => opt.tracks_on_planes = true,
             "--via-in-pad" => opt.via_in_pad = true,
             "--no-diff-pairs" => opt.diff_pairs = false,
+            "--skew" => {
+                opt.skew = Some(
+                    value(&mut i, &a)
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|m| *m >= 0.0)
+                        .unwrap_or_else(|| die("--skew needs a number of millimetres, 0 or more")),
+                )
+            }
+            "--match-length" => opt.match_groups.push(list(&value(&mut i, &a))),
+            "--meander" => opt.meander = mm(&value(&mut i, &a), &a),
             "--diff-pairs" => opt.only_pairs = Some(list(&value(&mut i, &a))),
             "--pair" => {
                 let v = value(&mut i, &a);
@@ -413,6 +429,21 @@ fn main() {
             );
         }
     }
+    for l in &result.lengths {
+        let short = l.target - l.after;
+        println!(
+            "  length of {}: {:.2} mm, was {:.2} ({}){}",
+            l.net,
+            l.after,
+            l.before,
+            l.why,
+            if short > 1e-3 {
+                format!("; {:.2} mm short of {:.2}: no room for more meanders", short, l.target)
+            } else {
+                String::new()
+            }
+        );
+    }
     if result.doubled > 0 || !result.single.is_empty() {
         println!(
             "  second vias beside the vias of wide tracks: {} added{}",
@@ -499,7 +530,7 @@ fn main() {
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
              \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \
              \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
-             \"narrowed\": {},\n  \"pairs\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
+             \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
             q(&input.display().to_string()),
             q(&output.display().to_string()),
@@ -549,6 +580,18 @@ fn main() {
                     p.coupled,
                     p.length_positive,
                     p.length_negative
+                ))
+                .collect()),
+            list(result
+                .lengths
+                .iter()
+                .map(|l| format!(
+                    "{{\"net\": {}, \"why\": {}, \"before_mm\": {:.3}, \"target_mm\": {:.3}, \"after_mm\": {:.3}}}",
+                    q(&l.net),
+                    q(&l.why),
+                    l.before,
+                    l.target,
+                    l.after
                 ))
                 .collect()),
             list(cuts

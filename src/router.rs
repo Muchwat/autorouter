@@ -13,6 +13,7 @@ use crate::board::Board;
 use crate::geom::{self, Shape, P};
 use crate::pair;
 use crate::rules::{Item, Rules};
+use crate::tune;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
@@ -65,6 +66,13 @@ pub struct Options {
     /// pair settings, else its track width and the clearance between the two nets).
     pub pair_width: Option<f64>,
     pub pair_gap: Option<f64>,
+    /// Bring the two halves of each differential pair within this of each
+    /// other in length (None: what a skew rule of the board says, if any).
+    pub skew: Option<f64>,
+    /// Groups of nets (wildcards) to bring to the length of the longest of the group.
+    pub match_groups: Vec<Vec<String>>,
+    /// The tallest bump of a meander, in mm.
+    pub meander: f64,
     /// Print progress to stderr.
     pub progress: bool,
 }
@@ -94,6 +102,9 @@ impl Default for Options {
             only_pairs: None,
             pair_width: None,
             pair_gap: None,
+            skew: None,
+            match_groups: Vec::new(),
+            meander: 1.0,
             progress: false,
         }
     }
@@ -128,6 +139,18 @@ pub struct NetReport {
     pub unrouted: Vec<String>,
 }
 
+/// A net whose length was asked for: by a rule, to match the other half of
+/// its pair, or to match its group.
+#[derive(Clone, Debug)]
+pub struct LengthReport {
+    pub net: String,
+    pub why: String,
+    /// Its tracks' length as routed, the length asked for, and what it has now.
+    pub before: f64,
+    pub target: f64,
+    pub after: f64,
+}
+
 /// How a differential pair came out.
 #[derive(Clone, Debug)]
 pub struct PairReport {
@@ -142,7 +165,8 @@ pub struct PairReport {
     pub coupled_legs: usize,
     pub width: f64,
     pub gap: f64,
-    /// Length routed side by side, and each track's whole length, in mm.
+    /// Length routed side by side, and each net's whole length (the tracks the
+    /// board already had and the new ones), in mm.
     pub coupled: f64,
     pub length_positive: f64,
     pub length_negative: f64,
@@ -162,6 +186,8 @@ pub struct Routed {
     pub single: Vec<(String, P)>,
     /// Differential pairs, routed as such or not.
     pub pairs: Vec<PairReport>,
+    /// Nets with a length to meet, and how near they came.
+    pub lengths: Vec<LengthReport>,
     /// Things the user should know about the board or the result.
     pub warnings: Vec<String>,
     pub log: Vec<String>,
@@ -1349,6 +1375,221 @@ impl<'a> Router<'a> {
         bad
     }
 
+    /// The length of a net's tracks: those the board already had and those laid.
+    fn net_length(&self, net: &str) -> f64 {
+        let mut len: f64 = self
+            .board
+            .tracks
+            .iter()
+            .filter(|t| t.net.as_deref() == Some(net))
+            .map(|t| geom::dist(t.a, t.b))
+            .sum();
+        for j in 0..self.jobs.len() {
+            let laid = match (&self.laid[j], self.active[j]) {
+                (Some(l), true) => l,
+                _ => continue,
+            };
+            if self.jobs[j].net == net {
+                len += laid.tracks.iter().map(|t| tune::length(&t.1)).sum::<f64>();
+            }
+            if self.jobs[j].pair.as_ref().map(|p| p.net_n == net).unwrap_or(false) {
+                len += laid.tracks_n.iter().map(|t| tune::length(&t.1)).sum::<f64>();
+            }
+        }
+        len
+    }
+
+    /// Lengthen a net's tracks by `extra` with meanders, wherever the jobs that
+    /// carry it have room. Returns how much was added.
+    fn lengthen(&mut self, net: &str, extra: f64) -> f64 {
+        let mut left = extra;
+        for j in 0..self.jobs.len() {
+            if left <= 1e-6 {
+                break;
+            }
+            if !self.active[j] || self.laid[j].is_none() {
+                continue;
+            }
+            let negative = if self.jobs[j].net == net {
+                false
+            } else if self.jobs[j].pair.as_ref().map(|p| p.net_n == net).unwrap_or(false) {
+                true
+            } else {
+                continue;
+            };
+            left -= self.lengthen_job(j, negative, left);
+        }
+        extra - left
+    }
+
+    /// Add meanders to job j's tracks (those of a pair's negative net, if
+    /// `negative`), up to `extra` longer. Each bump is kept only if it has room:
+    /// clear of other nets' copper by the job's own measure, a track's width or
+    /// more from the rest of its own net, and for a pair, on the side away from
+    /// the other half and clear of it.
+    fn lengthen_job(&mut self, j: usize, negative: bool, extra: f64) -> f64 {
+        let (gw, gh, g, x0, y0) = (self.gr.w, self.gr.h, self.gr.g, self.gr.x0, self.gr.y0);
+        let spec = self.jobs[j].pair.clone();
+        let (block, _) = self.hard(j);
+        let (soft, _) = self.soft(j);
+        let mut laid = self.laid[j].clone().expect("a routed job");
+        let net = match (&spec, negative) {
+            (Some(s), true) => s.net_n.clone(),
+            _ => self.jobs[j].net.clone(),
+        };
+        let width = spec.as_ref().map(|s| s.w).unwrap_or(self.jobs[j].width);
+        // a pair is checked as the one wide track it was routed as: about its middle
+        let shift = spec.as_ref().map(|s| (s.w + s.gap) / 2.0).unwrap_or(0.0);
+        let pn = spec.as_ref().map(|s| s.pn).unwrap_or(0.0);
+        let apart = width + width.max(self.rules.class_of(&net).clearance);
+        let m = tune::Meander {
+            spacing: apart,
+            amplitude: self.opt.meander,
+        };
+        // the rest of this net's copper, and the other half's, here and in the other
+        // stretches of the pair: (layer, a, b, width)
+        let mut own: Vec<(usize, P, P, f64)> = Vec::new();
+        let mut other: Vec<(usize, P, P, f64)> = Vec::new();
+        let mut other_vias: Vec<(P, f64)> = Vec::new();
+        for k in std::iter::once(j).chain(self.sibs[j].iter().cloned()) {
+            let lk = match (&self.laid[k], self.active[k]) {
+                (Some(l), true) => l,
+                _ => continue,
+            };
+            let kn = self.jobs[k].pair.as_ref().map(|p| p.net_n.as_str());
+            for (their, tracks) in [(Some(self.jobs[k].net.as_str()), &lk.tracks), (kn, &lk.tracks_n)] {
+                let list = match their {
+                    Some(t) if t == net => &mut own,
+                    Some(_) => &mut other,
+                    None => continue,
+                };
+                for (l, pts, w) in tracks.iter() {
+                    list.extend(pts.windows(2).map(|s| (*l, s[0], s[1], *w)));
+                }
+            }
+            if let Some(ks) = &self.jobs[k].pair {
+                let d = ks.via.map(|v| v.0).unwrap_or(0.0);
+                let theirs_negative = ks.net_n != net;
+                other_vias.extend(lk.real_vias.iter().filter(|v| v.1 == theirs_negative).map(|v| (v.0, d)));
+            }
+        }
+        let cells = |v: f64, origin: f64, most: usize| -> Vec<usize> {
+            // the grid lines either side of v (the one it is on, if it is on one)
+            let f = (v - origin) / g;
+            let r = f.round();
+            let list = if (f - r).abs() < 1e-6 {
+                vec![r]
+            } else {
+                vec![f.floor(), f.floor() + 1.0]
+            };
+            list.into_iter()
+                .filter(|c| *c >= 0.0 && (*c as usize) < most)
+                .map(|c| c as usize)
+                .collect()
+        };
+        let mut added_segs: Vec<(usize, P, P)> = Vec::new();
+        let mut total = 0.0;
+        let which = if negative { 1 } else { 0 };
+        let count = if negative {
+            laid.tracks_n.len()
+        } else {
+            laid.tracks.len()
+        };
+        for i in 0..count {
+            if extra - total <= 1e-6 {
+                break;
+            }
+            let (l, pts, w) = if which == 1 {
+                laid.tracks_n[i].clone()
+            } else {
+                laid.tracks[i].clone()
+            };
+            if (w - width).abs() > 1e-9 {
+                continue; // a narrowed piece into a pad
+            }
+            let mut ok = |b: &tune::Bump| -> bool {
+                let out = {
+                    let d = geom::dist(b[0], b[1]);
+                    ((b[1].0 - b[0].0) / d, (b[1].1 - b[0].1) / d)
+                };
+                for s in b.windows(2) {
+                    // room on the grid, by the job's own walls and the others' copper
+                    let len = geom::dist(s[0], s[1]);
+                    let steps = ((len / (g / 2.0)).ceil() as usize).max(1);
+                    for t in 0..=steps {
+                        let f = t as f64 / steps as f64;
+                        let p = (
+                            s[0].0 + f * (s[1].0 - s[0].0) - out.0 * shift,
+                            s[0].1 + f * (s[1].1 - s[0].1) - out.1 * shift,
+                        );
+                        let (ci, cj) = (cells(p.0, x0, gw), cells(p.1, y0, gh));
+                        if ci.is_empty() || cj.is_empty() {
+                            return false;
+                        }
+                        for &jj in &cj {
+                            for &ii in &ci {
+                                let c = jj * gw + ii;
+                                if block[l][c] != 0 || soft[l][c] != 0 {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    // the rest of its own net: not so near that the bump is shorted out
+                    for &(ol, a, c, _) in &own {
+                        if ol != l {
+                            continue;
+                        }
+                        // (the side the bump stands on holds both its feet: that one is not "the rest")
+                        if geom::seg_dist(b[0], a, c) < 1e-6 && geom::seg_dist(b[3], a, c) < 1e-6 {
+                            continue;
+                        }
+                        if geom::seg_seg_dist(s[0], s[1], a, c) < apart - 1e-6 {
+                            return false;
+                        }
+                    }
+                    for &(al, a, c) in &added_segs {
+                        if al == l
+                            && geom::seg_seg_dist(s[0], s[1], a, c) < apart - 1e-6
+                            && !(geom::dist(s[0], a) < 1e-9 || geom::dist(s[1], c) < 1e-9)
+                        {
+                            return false;
+                        }
+                    }
+                    // the other half of the pair
+                    for &(ol, a, c, ow) in &other {
+                        if ol == l && geom::seg_seg_dist(s[0], s[1], a, c) < width / 2.0 + ow / 2.0 + pn - 1e-6 {
+                            return false;
+                        }
+                    }
+                    for &(v, d) in &other_vias {
+                        if geom::seg_dist(v, s[0], s[1]) < d / 2.0 + width / 2.0 + pn - 1e-6 {
+                            return false;
+                        }
+                    }
+                }
+                added_segs.extend(b.windows(2).map(|s| (l, s[0], s[1])));
+                true
+            };
+            let (new, added) = tune::lengthen(&pts, extra - total, &m, &[1.0, -1.0], &mut ok);
+            if added > 0.0 {
+                total += added;
+                if which == 1 {
+                    laid.tracks_n[i].1 = new;
+                } else {
+                    laid.tracks[i].1 = new;
+                }
+            }
+        }
+        if total > 0.0 {
+            self.add(j, -1);
+            self.laid[j] = Some(laid);
+            self.contrib[j].clear();
+            self.add(j, 1);
+        }
+        total
+    }
+
     /// Put a second via beside each via of job j, joined to the first on every
     /// layer the net has a track at it: one small via is the weak point of a wide
     /// track. Returns (added, vias left single).
@@ -2428,6 +2669,8 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
     // it cannot. The jobs for the two whole nets are not used.
     let mut asleep: Vec<usize> = Vec::new();
     let mut pair_legs: Vec<(String, String, usize, f64, f64)> = Vec::new(); // (positive, negative, legs, width, gap)
+                                                                            // pairs with a stretch long enough to route as a pair: real pairs, whose lengths matter
+    let mut real_pairs: Vec<String> = Vec::new();
     let mut early_notes: Vec<(String, String)> = Vec::new();
     if opt.diff_pairs {
         let singles = jobs.len();
@@ -2563,6 +2806,9 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                 });
                 asleep.push(job_p);
                 asleep.push(job_n);
+                if !real_pairs.contains(&jobs[i].net) {
+                    real_pairs.push(jobs[i].net.clone());
+                }
             }
             asleep.push(i);
             asleep.push(k);
@@ -2871,6 +3117,94 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         }
     }
 
+    // lengths: the halves of a pair to within their skew, nets up to the least
+    // length a rule asks, and groups up to their longest
+    {
+        let mut nets: Vec<String> = Vec::new();
+        for j in 0..nj {
+            if r.active[j] {
+                nets.push(r.jobs[j].net.clone());
+                if let Some(p) = &r.jobs[j].pair {
+                    nets.push(p.net_n.clone());
+                }
+            }
+        }
+        nets.sort();
+        nets.dedup();
+        let bring = |r: &mut Router, net: &str, target: f64, why: String, lengths: &mut Vec<LengthReport>| {
+            let before = r.net_length(net);
+            if target - before > 1e-6 {
+                r.lengthen(net, target - before);
+            }
+            lengths.push(LengthReport {
+                net: net.to_string(),
+                why,
+                before,
+                target,
+                after: r.net_length(net),
+            });
+        };
+        for (p, n, _, _, _) in &pair_legs {
+            // (not nets that are only named like a pair, such as a capacitor's two ends)
+            if !real_pairs.contains(p) {
+                continue;
+            }
+            let limit = match opt.skew.or_else(|| rules.skew(p)) {
+                Some(l) => l,
+                None => continue,
+            };
+            let (lp, ln) = (r.net_length(p), r.net_length(n));
+            if (lp - ln).abs() <= limit {
+                continue;
+            }
+            let (short, long, target) = if lp < ln { (p, n, ln) } else { (n, p, lp) };
+            bring(
+                &mut r,
+                short,
+                target,
+                format!("to match {}, the other half of its pair", long),
+                &mut out.lengths,
+            );
+        }
+        for net in &nets {
+            if let Some((Some(least), _)) = rules.length(net) {
+                bring(&mut r, net, least, "a length rule".into(), &mut out.lengths);
+            }
+        }
+        for group in &opt.match_groups {
+            let members: Vec<&String> = nets.iter().filter(|n| matches(group, n)).collect();
+            let longest = members
+                .iter()
+                .map(|n| (r.net_length(n), n.to_string()))
+                .fold((0.0, String::new()), |a, b| if b.0 > a.0 { b } else { a });
+            for net in members {
+                if *net != longest.1 {
+                    bring(
+                        &mut r,
+                        net,
+                        longest.0,
+                        format!("to match {}, the longest of its group", longest.1),
+                        &mut out.lengths,
+                    );
+                }
+            }
+        }
+        for net in &nets {
+            if let Some((_, Some(most))) = rules.length(net) {
+                let len = r.net_length(net);
+                if len > most + 1e-6 {
+                    out.warnings.push(format!(
+                        "{} is {:.2} mm long, over the {:.2} mm a length rule allows (the router does not shorten tracks)",
+                        net, len, most
+                    ));
+                }
+            }
+        }
+        if !out.lengths.is_empty() {
+            r.say(format!("  lengths tuned: {} net(s)", out.lengths.len()));
+        }
+    }
+
     // wide tracks: a second via beside each via
     if opt.double_vias > 0.0 {
         for j in 0..nj {
@@ -2999,8 +3333,8 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
             width: *w,
             gap: *gap,
             coupled: mm,
-            length_positive: lengths.get(positive).cloned().unwrap_or(0.0),
-            length_negative: lengths.get(negative).cloned().unwrap_or(0.0),
+            length_positive: r.net_length(positive),
+            length_negative: r.net_length(negative),
         });
     }
     out.log.append(&mut r.log);
@@ -3568,6 +3902,142 @@ mod tests {
         for net in ["D+", "D-"] {
             assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
         }
+        assert!(smallest_gap(&b, &r) >= 0.2 - 1e-6);
+    }
+
+    /// The length of a net's new tracks.
+    fn routed_length(r: &Routed, net: &str) -> f64 {
+        r.tracks
+            .iter()
+            .filter(|t| t.net == net)
+            .map(|t| geom::dist(t.a, t.b))
+            .sum()
+    }
+
+    #[test]
+    fn a_group_of_nets_is_brought_to_the_length_of_its_longest() {
+        // three nets across the board, the third with much further to go
+        let s = String::from(HEAD)
+            + &smd("A1", "D0", 3.0, 4.0, 0.8, 0.8)
+            + &smd("A2", "D0", 20.0, 4.0, 0.8, 0.8)
+            + &smd("B1", "D1", 3.0, 9.0, 0.8, 0.8)
+            + &smd("B2", "D1", 24.0, 9.0, 0.8, 0.8)
+            + &smd("C1", "D2", 3.0, 14.0, 0.8, 0.8)
+            + &smd("C2", "D2", 27.0, 16.0, 0.8, 0.8)
+            + &smd("X1", "OTHER", 12.0, 6.5, 0.8, 0.8)
+            + "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let plain = route(&b, &rules(), &Options::default());
+        assert!(plain.lengths.is_empty(), "nothing is tuned unless asked");
+        let opt = Options {
+            match_groups: vec![vec!["D?".to_string()]],
+            ..Options::default()
+        };
+        let r = route(&b, &rules(), &opt);
+        assert!(r.complete(), "{:?}", r.nets);
+        let longest = routed_length(&plain, "D2");
+        assert!(routed_length(&plain, "D0") < longest - 5.0);
+        for net in ["D0", "D1", "D2"] {
+            let len = routed_length(&r, net);
+            assert!(
+                (len - longest).abs() < 1e-6,
+                "{} is {:.3} mm, not {:.3}",
+                net,
+                len,
+                longest
+            );
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert_eq!(r.lengths.len(), 2);
+        assert!(r
+            .lengths
+            .iter()
+            .all(|l| (l.after - l.target).abs() < 1e-6 && l.before < l.target));
+        // the meanders keep clear of everything else
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        // and of the track they belong to: no bump shorted out by its neighbour
+        for net in ["D0", "D1"] {
+            let segs: Vec<&NewTrack> = r.tracks.iter().filter(|t| t.net == net).collect();
+            for (i, a) in segs.iter().enumerate() {
+                for c in &segs[i + 1..] {
+                    let touching = [a.a, a.b]
+                        .iter()
+                        .any(|p| geom::dist(*p, c.a) < 1e-9 || geom::dist(*p, c.b) < 1e-9);
+                    if !touching {
+                        let d = geom::seg_seg_dist(a.a, a.b, c.a, c.b);
+                        assert!(d >= 0.45 - 1e-6, "two parts of {} run {:.3} mm apart", net, d);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_halves_of_a_pair_are_brought_within_their_skew() {
+        // the pair bends round a pad, so its outer track comes out longer
+        let b = pair_board(&smd("X", "OTHER", 15.0, 10.0, 3.0, 3.0));
+        let plain = route(&b, &rules(), &Options::default());
+        let apart = (routed_length(&plain, "D+") - routed_length(&plain, "D-")).abs();
+        assert!(
+            apart > 0.05,
+            "this board is meant to leave the pair uneven ({:.3} mm)",
+            apart
+        );
+        let r = route(
+            &b,
+            &rules(),
+            &Options {
+                skew: Some(0.01),
+                ..Options::default()
+            },
+        );
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(r.pairs[0].as_pair);
+        let (lp, ln) = (routed_length(&r, "D+"), routed_length(&r, "D-"));
+        assert!((lp - ln).abs() <= 0.01 + 1e-6, "still {:.3} mm apart", (lp - ln).abs());
+        assert_eq!(r.lengths.len(), 1);
+        for net in ["D+", "D-"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        // within the skew already: nothing is touched
+        let loose = route(
+            &b,
+            &rules(),
+            &Options {
+                skew: Some(apart + 0.1),
+                ..Options::default()
+            },
+        );
+        assert!(loose.lengths.is_empty());
+        assert_eq!(loose.tracks, plain.tracks);
+    }
+
+    #[test]
+    fn a_net_with_no_room_for_meanders_says_how_short_it_is() {
+        // boxed in by the board's edge on both sides
+        let s = String::from(HEAD)
+            + &smd("A1", "D0", 2.0, 1.0, 0.8, 0.8)
+            + &smd("A2", "D0", 18.0, 1.0, 0.8, 0.8)
+            + "(gr_rect (start 0 0) (end 20 2) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let mut rules = rules();
+        rules
+            .read_dru("(rule \"long\" (constraint length (min 40mm)) (condition \"A.NetName == 'D0'\"))")
+            .unwrap();
+        let r = route(&b, &rules, &Options::default());
+        assert!(r.complete());
+        assert_eq!(r.lengths.len(), 1);
+        let l = &r.lengths[0];
+        assert!((l.target - 40.0).abs() < 1e-9 && l.after < l.target, "{:?}", l);
         assert!(smallest_gap(&b, &r) >= 0.2 - 1e-6);
     }
 

@@ -23,4 +23,5 @@ pub mod pour;
 pub mod router;
 pub mod rules;
 pub mod sexpr;
+pub mod tune;
 pub mod write;

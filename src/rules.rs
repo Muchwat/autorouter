@@ -168,6 +168,10 @@ pub enum Kind {
     TrackWidth,
     EdgeClearance,
     DisallowVia,
+    /// The length of a net's tracks: `min`, `opt`, `max`.
+    Length,
+    /// How far apart in length the two halves of a differential pair may be: `max`.
+    Skew,
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +390,8 @@ impl Rules {
                     Some("clearance") => Kind::Clearance,
                     Some("track_width") => Kind::TrackWidth,
                     Some("edge_clearance") => Kind::EdgeClearance,
+                    Some("length") => Kind::Length,
+                    Some("skew") => Kind::Skew,
                     Some("disallow") => {
                         if c.args().iter().skip(1).any(|a| *a == "via" || *a == "through_via") {
                             Kind::DisallowVia
@@ -743,6 +749,34 @@ impl Rules {
         let it = Item::track(net);
         self.constrained(Kind::EdgeClearance, &it, &it, false, self.edge_clearance, |c| c.min)
             .max(self.edge_clearance)
+    }
+
+    /// The last rule of a kind that applies to this net for certain (a rule
+    /// that only might apply is no ground for adding copper).
+    fn last_for(&self, kind: Kind, net: &str) -> Option<&Constraint> {
+        let it = Item::track(net);
+        self.rules
+            .iter()
+            .filter(|r| self.applies(r, &it, &it, false) == T::Yes)
+            .flat_map(|r| r.constraints.iter())
+            .filter(|c| c.kind == kind)
+            .last()
+    }
+
+    /// The length the rules ask of this net's tracks: (at least, at most).
+    /// With an `opt`, both are that.
+    pub fn length(&self, net: &str) -> Option<(Option<f64>, Option<f64>)> {
+        let c = self.last_for(Kind::Length, net)?;
+        match c.opt {
+            Some(v) => Some((Some(v), Some(v))),
+            None => Some((c.min, c.max)),
+        }
+    }
+
+    /// The most the two halves of a differential pair may differ in length,
+    /// where a rule says (asked of the positive half's name).
+    pub fn skew(&self, net: &str) -> Option<f64> {
+        self.last_for(Kind::Skew, net).and_then(|c| c.max.or(c.opt))
     }
 }
 
@@ -1162,6 +1196,24 @@ mod tests {
         .unwrap();
         let c = r.class_of("/USB_D+");
         assert_eq!((c.pair_width, c.pair_gap, c.pair_via_gap), (0.2, 0.18, 0.25));
+    }
+
+    #[test]
+    fn length_and_skew_rules() {
+        let mut r = Rules::default();
+        r.read_dru(
+            "(version 1)\n\
+             (rule \"bus\" (constraint length (min 40mm) (max 42mm)) (condition \"A.NetName == 'D*'\"))\n\
+             (rule \"clock\" (constraint length (opt 50mm)) (condition \"A.NetName == 'CLK'\"))\n\
+             (rule \"usb\" (constraint skew (max 0.1mm)) (condition \"A.NetName == 'USB_D?'\"))\n\
+             (rule \"perhaps\" (constraint length (min 99mm)) (condition \"A.inDiffPair('X')\"))",
+        )
+        .unwrap();
+        assert_eq!(r.length("D0"), Some((Some(40.0), Some(42.0))));
+        assert_eq!(r.length("CLK"), Some((Some(50.0), Some(50.0))));
+        assert_eq!(r.length("RESET"), None, "a rule that only might apply adds no copper");
+        assert_eq!(r.skew("USB_D+"), Some(0.1));
+        assert_eq!(r.skew("D0"), None);
     }
 
     #[test]

@@ -20,7 +20,8 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **Kept fan-outs are used.** Where a net already has a track with a loose end (a locked fan-out, a half-drawn track), the new track ends on that end and nothing is left dangling.
 - **Vias stay off pads.** No via is put on a surface-mount pad of its own net (the open hole drains the solder joint) unless you pass `--via-in-pad`, and none in a through-hole pad or on another via.
 - **Wide tracks get two vias.** A track of 0.8 mm or more gets a second via beside each via, joined on both layers, so one small hole is not the weak point of a power path (`--double-vias`). Where there is no room, the via is listed.
-- **Differential pairs.** Nets named as a pair the way KiCad reads names (`D+`/`D-`, `CLK_P`/`CLK_N`, `TXP`/`TXN`, with any trailing digits), or as `DP`/`DM`, are routed side by side at a constant gap, with a via each where they change layer and a short piece each into their pads. A pair is done stretch by stretch between its parts: a stretch that cannot be had as a pair (the two nets the other way round at its ends, a part that splits them) is routed one net at a time, and the summary says which and why. Width and gap come from the net class's pair settings, or `--pair W/GAP`; `--no-diff-pairs` turns it off. No length matching yet.
+- **Differential pairs.** Nets named as a pair the way KiCad reads names (`D+`/`D-`, `CLK_P`/`CLK_N`, `TXP`/`TXN`, with any trailing digits), or as `DP`/`DM`, are routed side by side at a constant gap, with a via each where they change layer and a short piece each into their pads. A pair is done stretch by stretch between its parts: a stretch that cannot be had as a pair (the two nets the other way round at its ends, a part that splits them) is routed one net at a time, and the summary says which and why. Width and gap come from the net class's pair settings, or `--pair W/GAP`; `--no-diff-pairs` turns it off. The two halves can be brought to the same length (see below).
+- **Length matching.** Where a rule or an option asks, a track is lengthened with meanders: square bumps on its straight sides, each one kept only if it stays clear of other nets by the track's own clearances and a track's width or more from the rest of its own net. The two halves of a differential pair are brought within their skew (a `skew` rule, or `--skew`), a net up to the least length a `length` rule asks, and a group of nets up to the longest of them (`--match-length`). Lengths come out exact, not to the nearest grid step. The router never shortens a track; a net over a rule's maximum, or with no room for its meanders, is reported with what it lacks.
 - **It says why.** A piece left unjoined comes with a reason: no clear way in at that width, shut in by other copper with so many square millimetres of room, or no path between other nets' copper.
 - **The real board shape.** The outline (lines, arcs, circles, rectangles, polygons, Bezier curves, and edge cuts inside footprints), non-plated holes and milled slots, and keep-out areas are walls. An outline that is not closed is reported, and the board is routed without it.
 - **Any number of copper layers,** with through vias. An inner layer that a pour covers is treated as a plane and kept free of tracks, unless you pass `--tracks-on-planes`. Every track starts and ends on its pad's centre.
@@ -32,7 +33,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 |---|---|
 | `.kicad_pro` net classes | clearance, track width, via diameter and drill, differential pair width, gap and via gap; assignments and wildcard patterns |
 | `.kicad_pro` board rules | minimum clearance, copper-to-edge clearance, hole clearance, hole-to-hole gap |
-| `.kicad_dru` constraints | `clearance`, `track_width` (`opt` sets the width, `min` is a floor, `max` a cap), `edge_clearance`, `disallow via` |
+| `.kicad_dru` constraints | `clearance`, `track_width` (`opt` sets the width, `min` is a floor, `max` a cap), `edge_clearance`, `disallow via`, `length` (tracks are lengthened to `min` or `opt`; over `max` is reported), `skew` (`max`, between the halves of a pair) |
 | `.kicad_dru` conditions | `A/B.NetName`, `A/B.NetClass`, `A/B.Type`, `==` and `!=` with wildcards, `&&`, `\|\|`, `!`, `hasNetclass()`, `intersectsCourtyard()` and `insideCourtyard()` for pads |
 
 Conditions are evaluated with three values: true, false and "can't tell". Some tests can't be answered while routing, such as whether a track will cross a courtyard, or any function the router does not know. A rule whose condition might hold is applied, so the router errs on the safe side, and it prints a note naming the rule. Layer-limited rules are applied on every layer.
@@ -65,6 +66,11 @@ autorouter BOARD.kicad_pcb [options]
       --pair W/GAP       width of a pair's tracks and the gap between them, e.g. 0.2/0.15
                          (default: the net class's pair settings, else its track width
                          and the clearance between the two nets)
+      --skew MM          lengthen the shorter half of each pair until the two are within
+                         this of each other (default: a skew rule of the board, if any)
+      --match-length A,B bring these nets (wildcards) to the length of the longest of
+                         them, with meanders; may be given more than once, a group each
+      --meander MM       the tallest bump of a meander (default 1)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
@@ -119,7 +125,8 @@ The mains board is the case per-pair rules are for. Routed whole, mains included
 
 ## Limits
 
-- **A grid router.** Tracks run on a grid (0.25 mm by default) in 45-degree steps. There is no push-and-shove, no smoothing of the result, no differential pairs or length tuning.
+- **A grid router.** Tracks run on a grid (0.25 mm by default) in 45-degree steps. There is no push-and-shove and no smoothing of the result.
+- **Lengths.** A net's length is the sum of its tracks (those the board had and the new ones); vias and the path inside pads are not counted, and a net of more than two pads is measured as a whole, not pad to pad. Length and skew rules are followed only where their condition holds for certain. Meanders are square-cornered. A pair's skew is made up with bumps on its shorter half wherever there is room, not necessarily next to the bend that caused it.
 - **Pad shapes.** Custom pad shapes are taken as their bounding box, and trapezoids as their enclosing rectangle. That is safe but can block more than it needs to.
 - **Through vias only.** No blind or buried vias, and no micro vias.
 - **Rules on the safe side.** A condition the router can't settle makes the rule apply everywhere. A rule that exempts an area, like a courtyard, is honoured for the pads in that area but not for tracks near them.
