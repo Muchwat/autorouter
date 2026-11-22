@@ -20,7 +20,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **Kept fan-outs are used.** Where a net already has a track with a loose end (a locked fan-out, a half-drawn track), the new track ends on that end and nothing is left dangling.
 - **Vias stay off pads.** No via is put on a surface-mount pad of its own net (the open hole drains the solder joint) unless you pass `--via-in-pad`, and none in a through-hole pad or on another via.
 - **Wide tracks get two vias.** A track of 0.8 mm or more gets a second via beside each via, joined on both layers, so one small hole is not the weak point of a power path (`--double-vias`). Where there is no room, the via is listed.
-- **Differential pairs.** Nets named as a pair (`D+`/`D-`, `_P`/`_N`) are routed side by side at a constant gap, with a via each where they change layer and a short piece each into their pads. A pair is done stretch by stretch between its parts: a stretch that cannot be had as a pair (the two nets the other way round at its ends, a part that splits them) is routed one net at a time, and the summary says which and why. Width and gap come from the net class's pair settings, or `--pair W/GAP`; `--no-diff-pairs` turns it off. No length matching yet.
+- **Differential pairs.** Nets named as a pair the way KiCad reads names (`D+`/`D-`, `CLK_P`/`CLK_N`, `TXP`/`TXN`, with any trailing digits), or as `DP`/`DM`, are routed side by side at a constant gap, with a via each where they change layer and a short piece each into their pads. A pair is done stretch by stretch between its parts: a stretch that cannot be had as a pair (the two nets the other way round at its ends, a part that splits them) is routed one net at a time, and the summary says which and why. Width and gap come from the net class's pair settings, or `--pair W/GAP`; `--no-diff-pairs` turns it off. No length matching yet.
 - **It says why.** A piece left unjoined comes with a reason: no clear way in at that width, shut in by other copper with so many square millimetres of room, or no path between other nets' copper.
 - **The real board shape.** The outline (lines, arcs, circles, rectangles, polygons, Bezier curves, and edge cuts inside footprints), non-plated holes and milled slots, and keep-out areas are walls. An outline that is not closed is reported, and the board is routed without it.
 - **Any number of copper layers,** with through vias. An inner layer that a pour covers is treated as a plane and kept free of tracks, unless you pass `--tracks-on-planes`. Every track starts and ends on its pad's centre.
@@ -30,7 +30,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 
 | Where | What |
 |---|---|
-| `.kicad_pro` net classes | clearance, track width, via diameter and drill; assignments and wildcard patterns |
+| `.kicad_pro` net classes | clearance, track width, via diameter and drill, differential pair width, gap and via gap; assignments and wildcard patterns |
 | `.kicad_pro` board rules | minimum clearance, copper-to-edge clearance, hole clearance, hole-to-hole gap |
 | `.kicad_dru` constraints | `clearance`, `track_width` (`opt` sets the width, `min` is a floor, `max` a cap), `edge_clearance`, `disallow via` |
 | `.kicad_dru` conditions | `A/B.NetName`, `A/B.NetClass`, `A/B.Type`, `==` and `!=` with wildcards, `&&`, `\|\|`, `!`, `hasNetclass()`, `intersectsCourtyard()` and `insideCourtyard()` for pads |
@@ -60,6 +60,11 @@ autorouter BOARD.kicad_pcb [options]
       --neck MM          width a track narrows to where it is too wide to reach a pad
                          (default: the Default class's width, or the rules' minimum if more)
       --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
+      --no-diff-pairs    route nets named as pairs one by one, not as pairs
+      --diff-pairs A,B   only these nets as pairs (wildcards; either half's name)
+      --pair W/GAP       width of a pair's tracks and the gap between them, e.g. 0.2/0.15
+                         (default: the net class's pair settings, else its track width
+                         and the clearance between the two nets)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
       --report FILE      write what was done as JSON (for scripts and benchmarks)

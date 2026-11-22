@@ -296,6 +296,10 @@ struct PairSpec {
     ends: Vec<PairEnd>,
 }
 
+/// Stretches of a pair shorter than this (mm, between the middles of their
+/// ends) are routed one net at a time.
+const SHORTEST_PAIR: f64 = 4.0;
+
 /// Loose ends of a piece's tracks: (point, layer, track width). A track end is
 /// loose when no other copper of the piece holds it.
 fn loose_ends(parts: &[(Shape, Vec<usize>, bool)]) -> Vec<(P, usize, f64)> {
@@ -2424,17 +2428,19 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
     // it cannot. The jobs for the two whole nets are not used.
     let mut asleep: Vec<usize> = Vec::new();
     let mut pair_legs: Vec<(String, String, usize, f64, f64)> = Vec::new(); // (positive, negative, legs, width, gap)
+    let mut early_notes: Vec<(String, String)> = Vec::new();
     if opt.diff_pairs {
         let singles = jobs.len();
         for i in 0..singles {
-            let other = match crate::rules::pair_partner(&jobs[i].net) {
-                Some((name, true)) => name,
-                _ => continue,
-            };
-            let k = match jobs[..singles].iter().position(|jb| jb.net == other) {
+            // this net as a positive half, and whichever net exists as its other half
+            let k = match crate::rules::pair_partners(&jobs[i].net)
+                .iter()
+                .find_map(|name| jobs[..singles].iter().position(|jb| jb.net == *name))
+            {
                 Some(k) => k,
                 None => continue,
             };
+            let other = jobs[k].net.clone();
             if let Some(only) = &opt.only_pairs {
                 if !matches(only, &jobs[i].net) && !matches(only, &other) {
                     continue;
@@ -2511,6 +2517,21 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
                 };
                 let job_p = one(i, leg[0].piece_p, leg[1].piece_p, &mut jobs);
                 let job_n = one(k, leg[0].piece_n, leg[1].piece_n, &mut jobs);
+                // a stretch of a few millimetres is not worth pairing (and the name
+                // rule also catches nets that are no pair at all, such as the two
+                // ends of a capacitor beside its chip): those go one net at a time
+                let mid = |e: &PairEnd| ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
+                let far = geom::dist(mid(&leg[0]), mid(&leg[1]));
+                if far < SHORTEST_PAIR {
+                    early_notes.push((
+                        jobs[i].net.clone(),
+                        format!(
+                            "{} to {}: {:.1} mm is too short a stretch to pair",
+                            leg[0].label, leg[1].label, far
+                        ),
+                    ));
+                    continue;
+                }
                 let mut terminals = jobs[job_p].terminals.clone();
                 terminals.extend(jobs[job_n].terminals.iter().cloned());
                 let span = jobs[job_p].span.max(jobs[job_n].span);
@@ -2591,7 +2612,7 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
         planes,
         active,
         sibs,
-        pair_notes: Vec::new(),
+        pair_notes: early_notes,
         ngroups,
         board,
         rules,
@@ -3511,6 +3532,27 @@ mod tests {
                 assert!(geom::dist(v.at, u.at) >= 0.3 + 0.5 - 1e-9);
             }
         }
+    }
+
+    #[test]
+    fn a_stretch_too_short_to_pair_is_routed_one_by_one() {
+        // named like a pair, but 3 mm apart: the two ends of a capacitor beside its chip
+        let s = String::from(HEAD)
+            + &smd("C1", "CP", 10.0, 9.6, 0.5, 0.5)
+            + &smd("C2", "CN", 10.0, 10.4, 0.5, 0.5)
+            + &smd("U1", "CP", 13.0, 9.6, 0.5, 0.5)
+            + &smd("U2", "CN", 13.0, 10.4, 0.5, 0.5)
+            + "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert_eq!(r.pairs.len(), 1);
+        assert!(!r.pairs[0].as_pair);
+        assert!(r.pairs[0].note.contains("too short"), "{}", r.pairs[0].note);
+        for net in ["CP", "CN"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert!(smallest_gap(&b, &r) >= 0.2 - 1e-6);
     }
 
     #[test]

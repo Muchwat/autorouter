@@ -32,23 +32,59 @@ pub struct NetClass {
     pub pair_via_gap: f64,
 }
 
-/// A net named as one half of a differential pair, the way KiCad reads names:
-/// `USB_D+` / `USB_D-`, or `CLK_P` / `CLK_N`. Returns the other half's name
-/// and whether this one is the positive half.
+/// A net named as one half of a differential pair. Returns the other half's
+/// name and whether this one is the positive half.
+///
+/// The way KiCad reads names: past any trailing digits and underscores, the
+/// last character is `+` or `-`, or `P` or `N` (`USB_D+` / `USB_D-`, `CLK_P` /
+/// `CLK_N`, `LANE_P0` / `LANE_N0`, `TXP` / `TXN`). And, as USB lines are so
+/// often named, `DP` / `DM`. A net is only a pair if its other half exists.
 pub fn pair_partner(net: &str) -> Option<(String, bool)> {
-    for (mine, theirs, positive) in [
-        ("+", "-", true),
-        ("-", "+", false),
-        ("_P", "_N", true),
-        ("_N", "_P", false),
-    ] {
-        if let Some(base) = net.strip_suffix(mine) {
-            if !base.is_empty() {
-                return Some((format!("{}{}", base, theirs), positive));
+    let chars: Vec<char> = net.chars().collect();
+    // the character that says which half this is
+    let at = (0..chars.len())
+        .rev()
+        .find(|&i| !(chars[i].is_ascii_digit() || chars[i] == '_'))?;
+    if at == 0 {
+        return None; // nothing before it to be the pair's name
+    }
+    let swap = |with: char| -> String {
+        let mut other = chars.clone();
+        other[at] = with;
+        other.into_iter().collect()
+    };
+    match chars[at] {
+        '+' => Some((swap('-'), true)),
+        '-' => Some((swap('+'), false)),
+        'N' => Some((swap('P'), false)),
+        // (DP is the positive half of DP / DM as well as of DP / DN: the caller
+        // looks for whichever exists, see `pair_partners`)
+        'P' => Some((swap('N'), true)),
+        'M' if chars[at - 1] == 'D' => Some((swap('P'), false)),
+        _ => None,
+    }
+}
+
+/// Every name the other half of a pair might have, for a net that may be the
+/// positive half: `…P` pairs with `…N`, and `…DP` with `…DM` too.
+pub fn pair_partners(net: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some((other, true)) = pair_partner(net) {
+        out.push(other.clone());
+        // …DN -> …DM
+        let chars: Vec<char> = other.chars().collect();
+        if let Some(at) = (0..chars.len())
+            .rev()
+            .find(|&i| !(chars[i].is_ascii_digit() || chars[i] == '_'))
+        {
+            if at > 0 && chars[at] == 'N' && chars[at - 1] == 'D' {
+                let mut m = chars.clone();
+                m[at] = 'M';
+                out.push(m.into_iter().collect());
             }
         }
     }
-    None
+    out
 }
 
 /// What a rule can know about one of the two items it compares.
@@ -1104,6 +1140,20 @@ mod tests {
         assert_eq!(pair_partner("CLK_N"), Some(("CLK_P".to_string(), false)));
         assert_eq!(pair_partner("RESET"), None);
         assert_eq!(pair_partner("+"), None);
+        // past trailing digits and underscores, as KiCad reads them
+        assert_eq!(pair_partner("LANE_P0"), Some(("LANE_N0".to_string(), true)));
+        assert_eq!(pair_partner("TXN"), Some(("TXP".to_string(), false)));
+        // USB's DP / DM
+        assert_eq!(
+            pair_partners("/ESP_USB_DP"),
+            vec!["/ESP_USB_DN".to_string(), "/ESP_USB_DM".to_string()]
+        );
+        assert_eq!(pair_partner("/ESP_USB_DM"), Some(("/ESP_USB_DP".to_string(), false)));
+        assert_eq!(pair_partners("/USB_D+"), vec!["/USB_D-".to_string()]);
+        assert!(
+            pair_partners("/USB_D-").is_empty(),
+            "only the positive half looks for its partner"
+        );
         let mut r = Rules::default();
         r.read_project(
             r#"{"net_settings": {"classes": [{"name": "Default", "clearance": 0.2, "track_width": 0.25,
