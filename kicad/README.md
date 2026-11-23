@@ -54,6 +54,10 @@ What happens when you press Route:
 3. The tracks and vias it laid are added to the open board (and with "take up" ticked, the unlocked tracks and vias of the nets it routed are taken out first, as the router did). The zones are poured again.
 4. A summary says what was joined, what was not and why, and any pour the new tracks may have cut. Run the DRC before you plot. Ctrl+Z takes the whole run back.
 
+## The icon
+
+A capital A on two layers: the left side on the front copper, the right on the back, changing layer at the via on top, with pads for feet. `python3 kicad/make_icon.py` draws it (`icon.png` for the toolbar, `icon-64.png` for the package list), and `--preview` draws every design side by side, at toolbar size on light and dark.
+
 ## Try it from a script
 
 `core.py` does the work and needs no window, so the plugin can be tried on a board without the editor, with KiCad's own Python:
