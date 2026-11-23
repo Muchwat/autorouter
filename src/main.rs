@@ -359,6 +359,9 @@ fn main() {
     }
 
     let mut removed = 0;
+    // the nets whose unlocked tracks and vias were taken out (for the report: a
+    // plugin that adds the result to an open board takes out the same)
+    let mut ripped: Vec<String> = Vec::new();
     if rip {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         for t in &board.tracks {
@@ -369,6 +372,7 @@ fn main() {
                     .unwrap_or(false)
             {
                 spans.push(t.span);
+                ripped.extend(t.net.clone());
             }
         }
         for v in &board.vias {
@@ -379,8 +383,11 @@ fn main() {
                     .unwrap_or(false)
             {
                 spans.push(v.span);
+                ripped.extend(v.net.clone());
             }
         }
+        ripped.sort();
+        ripped.dedup();
         spans.sort();
         spans.dedup();
         removed = spans.len();
@@ -661,7 +668,8 @@ fn main() {
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
              \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \"blind_vias\": {},\n  \"buried_vias\": {},\n  \
              \"plane_nets\": {},\n  \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
-             \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
+             \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {},\n  \
+             \"ripped_nets\": {},\n  \"new_tracks\": {},\n  \"new_vias\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
             q(&input.display().to_string()),
             q(&output.display().to_string()),
@@ -743,7 +751,36 @@ fn main() {
             match drc_counts {
                 Some((e, u)) => format!("{{\"errors\": {}, \"unconnected\": {}}}", e, u),
                 None => "null".to_string(),
-            }
+            },
+            list(ripped.iter().map(|n| q(n)).collect()),
+            list(result
+                .tracks
+                .iter()
+                .map(|t| format!(
+                    "{{\"net\": {}, \"layer\": {}, \"start\": [{}, {}], \"end\": [{}, {}], \"width\": {}}}",
+                    q(&t.net),
+                    q(&board.copper[t.layer]),
+                    t.a.0,
+                    t.a.1,
+                    t.b.0,
+                    t.b.1,
+                    t.width
+                ))
+                .collect()),
+            list(result
+                .vias
+                .iter()
+                .map(|v| format!(
+                    "{{\"net\": {}, \"at\": [{}, {}], \"diameter\": {}, \"drill\": {}, \"layers\": [{}, {}]}}",
+                    q(&v.net),
+                    v.at.0,
+                    v.at.1,
+                    v.diameter,
+                    v.drill,
+                    q(&board.copper[v.layers.0]),
+                    q(&board.copper[v.layers.1])
+                ))
+                .collect()),
         );
         if let Err(e) = std::fs::write(&path, text) {
             eprintln!("autorouter: cannot write {}: {}", path.display(), e);

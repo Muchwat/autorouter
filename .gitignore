@@ -3,3 +3,5 @@
 bench/boards.txt
 bench/results.json
 bench/widths/
+kicad/dist/
+__pycache__/

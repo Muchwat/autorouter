@@ -88,7 +88,8 @@ autorouter BOARD.kicad_pcb [options]
       --meander MM       the tallest bump of a meander (default 1)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
-      --report FILE      write what was done as JSON (for scripts and benchmarks)
+      --report FILE      write what was done as JSON (for scripts and benchmarks), with
+                         every track and via added and the nets whose tracks were taken up
       --via-cost N       what a via costs, in grid steps (default 12)
       --passes N         most negotiation passes (default 40)
       --drc              refill the zones and check the result with KiCad's DRC (kicad-cli),
@@ -105,6 +106,20 @@ The exit status is 0 when every net is joined (and, with `--drc`, KiCad finds no
 Nets with a copper pour (GND, usually) are left to the pour unless you pass `--include-poured`; a net with an inner plane has its pads joined to the plane (see above), and `--rip` leaves its existing tracks and vias in place either way. New tracks can cut a pour into islands. The router estimates this on a fine grid and warns when pads that the pour joined before routing are cut off after it; with `--drc`, KiCad's own fill decides. Add stitching vias, or route the poured net too.
 
 **Grid.** Walls and conflicts are tested at grid points, so a track between two points can pass a little nearer to other copper than the points do. Every clearance carries a margin for that, worked out from the grid: 0.05 mm at the default 0.25 mm, more on a coarser grid (about 0.45 mm at 1 mm). A coarse grid is safe but packs tracks loosely.
+
+### In KiCad
+
+A plugin for the PCB editor runs the router on the open board and puts what it lays on the board as one step that Undo takes back. Install the router, then the plugin:
+
+```bash
+cargo install --git https://github.com/Muchwat/autorouter
+```
+
+```bash
+python3 kicad/install.py
+```
+
+Restart the PCB editor; **Tools > External Plugins > Autoroute** (or its toolbar button) opens a dialog with the common options: which nets, rip up first, grid, differential pairs, fan-out, plane vias, blind and buried vias, and a field for any other option. It routes the board as it stands in the editor, unsaved changes included, and pours the zones again when it is done. See [kicad/README.md](kicad/README.md) for the details, the Plugin and Content Manager package, and a way to try it from a script.
 
 ### As a library
 
@@ -166,6 +181,7 @@ The mains board is the case per-pair rules are for. Routed whole, mains included
 - **Planes.** A pad is joined to its plane wherever a via fits near it; the router does not check that the plane's copper around that via is still in one piece with the rest (a via among many others can stand on an island), so run `--drc`. Every pad gets its own via or track, even where a pour would have joined several once one of them is on the plane. Pieces of a pour with no pad on them are not stitched to the plane, and split planes are taken by their outlines, with no account of which zone has priority where they overlap.
 - **Pours on outer layers are not planned for.** Inner planes are left whole, but on a layer it routes on the router does not steer tracks to keep a pour in one piece; it warns after the fact.
 - **Speed.** One core. A dense 4-layer board of 190 nets takes a few minutes.
+- **The KiCad plugin** uses KiCad's Python scripting interface (SWIG), which KiCad has said it will replace with its newer IPC interface; it was written and tried with KiCad 10.0. It reads the rules from the project's files on disk, so net class or custom rule changes not yet saved are not seen (unsaved changes to the board itself are). While the router runs, the editor waits.
 - **Check the result.** Run KiCad's DRC (or `--drc`) before you order a board. The router's own checks are on its grid; KiCad has the final word.
 
 ## How it works
