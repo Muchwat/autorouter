@@ -69,6 +69,10 @@ pub struct Options {
     /// tight fine-pitch pads) with an escape track or a dog-bone via, placed
     /// exactly.
     pub fanout: bool,
+    /// Join the pads of a net that has an inner plane to that plane, with a
+    /// via each (or a track to copper that is on it already). Off: such a net
+    /// is left alone, as a net with a pour.
+    pub plane_vias: bool,
     /// How far from its pad a fan-out may end, in mm.
     pub fanout_length: f64,
     /// Route nets named as differential pairs (`D+`/`D-`, `_P`/`_N`) as pairs.
@@ -113,6 +117,7 @@ impl Default for Options {
             tracks_on_planes: false,
             via_spans: Vec::new(),
             fanout: true,
+            plane_vias: true,
             fanout_length: 2.0,
             diff_pairs: true,
             only_pairs: None,
@@ -208,6 +213,9 @@ pub struct Routed {
     pub lengths: Vec<LengthReport>,
     /// Things the user should know about the board or the result.
     pub warnings: Vec<String>,
+    /// Nets joined to an inner plane of their own: (net, the plane's layers,
+    /// pieces that were not on it yet).
+    pub planes: Vec<(String, Vec<usize>, usize)>,
     /// Pads brought out by a fan-out that the routing went on from.
     pub fanouts: Vec<FanReport>,
     /// Pads the grid could not reach and no fan-out fits either: (pad, net, why).
@@ -314,6 +322,9 @@ struct Job {
     widths: Vec<f64>,
     /// The via spans it may use, shortest first (a through via among them, unless ruled out).
     spans: Vec<Span>,
+    /// Inner layers the net has a plane on. Its first terminal is then that
+    /// plane: a via that comes down on it anywhere joins it.
+    plane: Vec<usize>,
     width: f64,
     via: Option<(f64, f64)>,
     /// Extra gap on every clearance of this job: walls and conflicts are tested
@@ -616,6 +627,9 @@ struct Search<'a> {
     /// How many steps a path must go on from one via before its next, where
     /// the two would share a layer (two holes want their distance).
     keep: usize,
+    /// Per layer: a plane of the net's own. A path may come down on it or
+    /// leave it by a via, but lays no track there.
+    flat: &'a [bool],
     hist: &'a [Vec<f32>],
     pres: f64,
     via_cost: f64,
@@ -710,6 +724,9 @@ fn astar(
             }
         };
         for &(di, dj, c) in DIRS.iter() {
+            if s.flat[l] {
+                break;
+            }
             let (ni, nj) = (i + di, j + dj);
             if ni < 0 || ni >= w || nj < 0 || nj >= h {
                 continue;
@@ -859,6 +876,40 @@ impl<'a> Router<'a> {
         for l in 0..nl {
             if !self.layers_ok(l) {
                 block[l] = vec![1; n];
+            }
+        }
+        // the net's own plane: a via may come down anywhere inside it, a via's
+        // radius from its edge (no track is laid there: the search sees to that)
+        for &l in &self.jobs[j].plane {
+            block[l] = vec![1; n];
+            let inset = vr.unwrap_or(0.0) + m;
+            for z in self
+                .board
+                .zones
+                .iter()
+                .filter(|z| z.keepout.is_none() && z.net.as_deref() == Some(net.as_str()) && z.layers.contains(&l))
+            {
+                let (mut x0, mut y0, mut x1, mut y1) =
+                    (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for p in &z.outline {
+                    x0 = x0.min(p.0);
+                    y0 = y0.min(p.1);
+                    x1 = x1.max(p.0);
+                    y1 = y1.max(p.1);
+                }
+                let (i0, j0, i1, j1) = self.gr.range((x0, y0, x1, y1), 0.0);
+                for jj in j0..=j1 {
+                    for ii in i0..=i1 {
+                        let c = jj * self.gr.w + ii;
+                        let p = self.gr.xy(c);
+                        if self.outside[c] == 0
+                            && geom::in_polygon(p, &z.outline)
+                            && geom::polygon_edge_dist(p, &z.outline) >= inset
+                        {
+                            block[l][c] = 0;
+                        }
+                    }
+                }
             }
         }
         let ec = self.rules.edge_clearance(&net);
@@ -2233,6 +2284,7 @@ impl<'a> Router<'a> {
         let search_via = if vblock.is_some() { via_cost } else { 0.0 };
         let spans = self.jobs[j].spans.clone();
         let keep = self.keep(j);
+        let flat = vec![false; nl];
         let hist = std::mem::take(&mut self.hist);
         let mut stopped: Option<String> = None;
         for k in 0..spec.ends.len().saturating_sub(1) {
@@ -2254,6 +2306,7 @@ impl<'a> Router<'a> {
                     soft_via: &sv,
                     spans: &spans,
                     keep,
+                    flat: &flat,
                     hist: &hist,
                     pres,
                     via_cost: search_via,
@@ -2440,7 +2493,12 @@ impl<'a> Router<'a> {
         let terms = self.jobs[j].terminals.len();
         let centre = |t: usize| -> P { self.jobs[j].terminals[t].centre };
         let mut todo: Vec<usize> = (0..terms).collect();
-        let first = {
+        // a net with a plane starts from the plane (its first terminal)
+        let plane = self.jobs[j].plane.clone();
+        let flat: Vec<bool> = (0..nl).map(|l| plane.contains(&l)).collect();
+        let first = if !plane.is_empty() {
+            0
+        } else {
             let cx = todo.iter().map(|&t| centre(t).0).sum::<f64>() / terms as f64;
             let cy = todo.iter().map(|&t| centre(t).1).sum::<f64>() / terms as f64;
 
@@ -2492,12 +2550,45 @@ impl<'a> Router<'a> {
                 soft_via: &sv,
                 spans: &spans,
                 keep,
+                flat: &flat,
                 hist: &hist,
                 pres,
                 via_cost: search_via,
                 limit,
             };
-            match astar(&self.gr, &mut self.work, &s, &tree, &states[next], centre(next)) {
+            let found = if plane.is_empty() {
+                astar(&self.gr, &mut self.work, &s, &tree, &states[next], centre(next))
+            } else {
+                // from the copper joined so far, or from the plane itself: anywhere on it
+                // near this piece, and further off if that fails
+                let mut found = None;
+                for reach in [4.0, 12.0] {
+                    let mut from = tree.clone();
+                    for &l in &plane {
+                        let bl = &block[l];
+                        self.gr.each(
+                            &Shape::Circle {
+                                c: centre(next),
+                                r: 0.0,
+                            },
+                            reach,
+                            |c| {
+                                if bl[c] == 0 {
+                                    from.push((l * n + c) as u32);
+                                }
+                            },
+                        );
+                    }
+                    from.sort();
+                    from.dedup();
+                    found = astar(&self.gr, &mut self.work, &s, &from, &states[next], centre(next));
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                found
+            };
+            match found {
                 None => {
                     // say which side is shut in, when one is
                     let most = |st: &[u32]| st.iter().map(|&s| room[s as usize]).max().unwrap_or(0);
@@ -2788,9 +2879,26 @@ pub fn route(board: &Board, rules: &Rules, opt: &Options) -> Routed {
     if !fans.is_empty() {
         // the ones a new track touches (past the pad itself) are part of the
         // result; the rest are not written
+        let planes = plane_layers(board);
         let used: Vec<&Fan> = fans
             .iter()
             .filter(|f| {
+                // a via that comes down on the net's own plane has done its work
+                let on_plane = f
+                    .via
+                    .map(|(at, _, _, (a, b))| {
+                        opt.plane_vias
+                            && board.zones.iter().any(|z| {
+                                z.keepout.is_none()
+                                    && z.net.as_deref() == Some(f.net.as_str())
+                                    && z.layers.iter().any(|l| planes.contains(l) && a <= *l && *l <= b)
+                                    && geom::in_polygon(at, &z.outline)
+                            })
+                    })
+                    .unwrap_or(false);
+                if on_plane {
+                    return true;
+                }
                 let pad = f.tracks.first().map(|t| t.0).unwrap_or(f.end);
                 out.tracks.iter().filter(|t| t.net == f.net).any(|t| {
                     [t.a, t.b].iter().any(|&p| {
@@ -3036,9 +3144,25 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
     let mut jobs: Vec<Job> = Vec::new();
     let mut sigs: Vec<String> = Vec::new();
     let smallest = rules.smallest_clearance();
+    let all_planes = plane_layers(board);
     for (net, items) in by_net {
         let pads = items.iter().filter(|i| i.2).count();
-        if pads < 2 {
+        // the inner planes of its own: its pads are joined to them, one by one
+        let own_planes: Vec<usize> = if opt.plane_vias && !opt.no_vias {
+            all_planes
+                .iter()
+                .cloned()
+                .filter(|&l| {
+                    board
+                        .zones
+                        .iter()
+                        .any(|z| z.keepout.is_none() && z.net.as_deref() == Some(net.as_str()) && z.layers.contains(&l))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if pads < 2 && (own_planes.is_empty() || pads == 0) {
             continue;
         }
         if net.starts_with("unconnected-") {
@@ -3053,7 +3177,7 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
             out.skipped.push((net, "skipped as asked".into()));
             continue;
         }
-        if poured.contains(&net) && !opt.include_poured {
+        if poured.contains(&net) && !opt.include_poured && own_planes.is_empty() {
             out.skipped.push((net, "has a copper pour".into()));
             continue;
         }
@@ -3104,6 +3228,45 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
                 }
             })
             .collect();
+        let mut terminals = terminals;
+        if !own_planes.is_empty() {
+            // which pads the net's copper joins to the plane as it stands: through
+            // the plane itself, a via down to it, or a pour that is joined to it. (A
+            // pad in a pour that is an island apart from the plane is not.)
+            let there = crate::pour::on_plane(board, rules, &net, &own_planes, g);
+            let pad_at = |at: P| {
+                board
+                    .pads
+                    .iter()
+                    .filter(|p| p.net.as_deref() == Some(net.as_str()))
+                    .position(|p| p.shape.centre() == at)
+            };
+            let (on_plane, loose): (Vec<Terminal>, Vec<Terminal>) = terminals.into_iter().partition(|t| {
+                t.parts
+                    .iter()
+                    .filter(|part| part.2)
+                    .any(|part| pad_at(part.0.centre()).map(|k| there[k]).unwrap_or(false))
+            });
+            if loose.is_empty() {
+                out.skipped.push((net, "has a copper pour".into()));
+                continue;
+            }
+            out.planes.push((net.clone(), own_planes.clone(), loose.len()));
+            // the plane, with the copper that is on it already, is the piece the rest join
+            let the_plane = Terminal {
+                label: format!(
+                    "the {} plane",
+                    own_planes
+                        .iter()
+                        .map(|&l| board.copper[l].as_str())
+                        .collect::<Vec<&str>>()
+                        .join(" / ")
+                ),
+                centre: loose[0].centre,
+                parts: on_plane.into_iter().flat_map(|t| t.parts).collect(),
+            };
+            terminals = std::iter::once(the_plane).chain(loose).collect();
+        }
         if terminals.len() < 2 {
             continue; // already joined
         }
@@ -3167,6 +3330,7 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
             net,
             widths,
             spans,
+            plane: own_planes,
             width,
             via,
             margin,
@@ -3199,6 +3363,10 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
                 Some(k) => k,
                 None => continue,
             };
+            // (a net joined to its plane is no half of a pair)
+            if !jobs[i].plane.is_empty() || !jobs[k].plane.is_empty() {
+                continue;
+            }
             let other = jobs[k].net.clone();
             if let Some(only) = &opt.only_pairs {
                 if !matches(only, &jobs[i].net) && !matches(only, &other) {
@@ -3281,6 +3449,7 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
                         net: jobs[of].net.clone(),
                         widths: jobs[of].widths.clone(),
                         spans: jobs[of].spans.clone(),
+                        plane: Vec::new(),
                         width: jobs[of].width,
                         via: jobs[of].via,
                         margin: jobs[of].margin,
@@ -3317,6 +3486,7 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
                 jobs.push(Job {
                     net,
                     widths: fat.clone(),
+                    plane: Vec::new(),
                     // (the vias both nets may use)
                     spans: jobs[i]
                         .spans
@@ -5129,6 +5299,151 @@ mod tests {
         // and with ordinary parts nothing is fanned out
         let plain = route(&crossing(), &self::rules(), &Options::default());
         assert!(plain.fanouts.is_empty() && plain.shut_in.is_empty());
+    }
+
+    /// Four layers with a GND plane on In1 and three GND pads on the front, with
+    /// two signal nets between them. `extra`: more board.
+    fn plane_board(extra: &str) -> Board {
+        let s = String::from(HEAD4)
+            + &smd("C1", "GND", 5.0, 5.0, 0.8, 0.8)
+            + &smd("C2", "GND", 15.0, 10.0, 0.8, 0.8)
+            + &smd("C3", "GND", 25.0, 15.0, 0.8, 0.8)
+            + &smd("J1", "A", 3.0, 10.0, 0.8, 0.8)
+            + &smd("J2", "A", 27.0, 10.0, 0.8, 0.8)
+            + "(zone (net \"GND\") (layer \"In1.Cu\") (polygon (pts (xy 0.5 0.5) (xy 29.5 0.5) (xy 29.5 19.5) (xy 0.5 19.5))))\n"
+            + extra
+            + "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
+        Board::parse(s).unwrap()
+    }
+
+    /// Whether every pad of `net` is joined, by the net's tracks and vias, to a
+    /// via that comes down on `layer`.
+    fn on_the_plane(b: &Board, r: &Routed, net: &str, layer: usize) -> bool {
+        let mut items: Vec<(Shape, Vec<usize>, bool, String)> = Vec::new();
+        for p in b.pads.iter().filter(|p| p.net.as_deref() == Some(net)) {
+            items.push((p.shape, p.layers.clone(), true, p.name()));
+        }
+        let pads = items.len();
+        let kept = b
+            .tracks
+            .iter()
+            .filter(|t| t.net.as_deref() == Some(net))
+            .map(|t| (t.a, t.b, t.width, t.layer));
+        let laid = r
+            .tracks
+            .iter()
+            .filter(|t| t.net == net)
+            .map(|t| (t.a, t.b, t.width, t.layer));
+        for (a, z, w, layer) in kept.chain(laid) {
+            // (a track joins layers no more than a pad does)
+            items.push((Shape::Capsule { a, b: z, r: w / 2.0 }, vec![layer], true, String::new()));
+        }
+        let old = b
+            .vias
+            .iter()
+            .filter(|v| v.net.as_deref() == Some(net))
+            .map(|v| (v.at, v.diameter, v.layers));
+        let new = r
+            .vias
+            .iter()
+            .filter(|v| v.net == net)
+            .map(|v| (v.at, v.diameter, v.layers));
+        for (at, d, (a, z)) in old.chain(new) {
+            items.push((
+                Shape::Circle { c: at, r: d / 2.0 },
+                (a..=z).collect(),
+                false,
+                String::new(),
+            ));
+        }
+        let mut group: Vec<usize> = (0..items.len()).collect();
+        loop {
+            let mut changed = false;
+            for i in 0..items.len() {
+                for k in i + 1..items.len() {
+                    if group[i] != group[k] && joined(&items[i], &items[k]) {
+                        let (from, to) = (group[k].max(group[i]), group[k].min(group[i]));
+                        group.iter_mut().filter(|g| **g == from).for_each(|g| *g = to);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        (0..pads).all(|i| (0..items.len()).any(|k| group[k] == group[i] && !items[k].2 && items[k].1.contains(&layer)))
+    }
+
+    #[test]
+    fn pads_are_joined_to_their_plane_with_vias() {
+        let b = plane_board("");
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert_eq!(r.planes, vec![("GND".to_string(), vec![1], 3)]);
+        assert_eq!(
+            r.vias.iter().filter(|v| v.net == "GND").count(),
+            3,
+            "a via for each pad: {:?}",
+            r.vias
+        );
+        assert!(on_the_plane(&b, &r, "GND", 1));
+        assert!(r.tracks.iter().all(|t| t.layer != 1), "a track was laid on the plane");
+        // no via in a pad, and each one inside the plane
+        for v in r.vias.iter().filter(|v| v.net == "GND") {
+            assert!(v.layers.0 == 0 && v.layers.1 >= 1);
+            assert!(b.pads.iter().all(|p| p.shape.dist(v.at) > v.drill / 2.0));
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        // switched off, the net is left to its pour as before
+        let off = route(
+            &b,
+            &rules(),
+            &Options {
+                plane_vias: false,
+                ..Options::default()
+            },
+        );
+        assert!(off.planes.is_empty() && off.vias.iter().all(|v| v.net != "GND"));
+        assert!(off.skipped.iter().any(|(n, why)| n == "GND" && why.contains("pour")));
+    }
+
+    #[test]
+    fn a_pad_already_on_the_plane_gets_no_second_via() {
+        // C1 has a track to a via that comes down on the plane; a fourth pad stands right beside it
+        let extra = String::from("(segment (start 5 5) (end 6.5 5) (width 0.25) (layer \"F.Cu\") (net \"GND\"))\n")
+            + "(via (at 6.5 5) (size 0.6) (drill 0.3) (layers \"F.Cu\" \"B.Cu\") (net \"GND\"))\n"
+            + &smd("C4", "GND", 5.0, 6.5, 0.8, 0.8);
+        let b = plane_board(&extra);
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        assert_eq!(r.planes[0].2, 3, "C1 is on the plane already: C2, C3 and C4 are not");
+        assert!(on_the_plane(&b, &r, "GND", 1));
+        // C4 is nearer to C1's copper than a via is worth: a track, no via
+        assert_eq!(r.vias.iter().filter(|v| v.net == "GND").count(), 2, "{:?}", r.vias);
+    }
+
+    #[test]
+    fn a_plane_via_is_blind_where_that_is_allowed() {
+        let b = plane_board("");
+        let opt = Options {
+            via_spans: vec![(0, 1)],
+            ..Options::default()
+        };
+        let r = route(&b, &rules(), &opt);
+        assert!(r.complete(), "{:?}", r.nets);
+        let gnd: Vec<&NewVia> = r.vias.iter().filter(|v| v.net == "GND").collect();
+        assert_eq!(gnd.len(), 3);
+        assert!(
+            gnd.iter().all(|v| v.layers == (0, 1)),
+            "from the front to the plane and no further: {:?}",
+            gnd
+        );
+        assert!(on_the_plane(&b, &r, "GND", 1));
     }
 
     #[test]

@@ -32,6 +32,9 @@ usage: autorouter BOARD.kicad_pcb [options]
                          go right through the board)
       --blind-vias       any blind or buried via: every pair of layers
       --via-in-pad       let vias sit on surface-mount pads of their own net
+      --no-plane-vias    leave a net that has an inner plane alone, as any net with a
+                         pour (by default each of its pads not yet on the plane, or in
+                         another pour of the net, is joined to the plane with a via)
       --no-fanout        do not bring out pads the grid cannot reach (the inner balls of
                          a BGA, tight fine-pitch pads) with an escape track or a via
       --fanout-length MM how far from its pad a fan-out may end (default 2)
@@ -218,6 +221,7 @@ fn main() {
             "--via-spans" => span_names.extend(list(&value(&mut i, &a))),
             "--blind-vias" => any_span = true,
             "--no-fanout" => opt.fanout = false,
+            "--no-plane-vias" => opt.plane_vias = false,
             "--fanout-length" => opt.fanout_length = mm(&value(&mut i, &a), &a),
             "--grid" => opt.grid = mm(&value(&mut i, &a), &a),
             "--margin" => {
@@ -545,6 +549,32 @@ fn main() {
             );
         }
     }
+    for (net, layers, pieces) in &result.planes {
+        let left = result
+            .nets
+            .iter()
+            .find(|n| n.net == *net)
+            .map(|n| n.unrouted.len())
+            .unwrap_or(0);
+        println!(
+            "  {}: {} of {} piece{} joined to its plane on {}, with {} via{}",
+            net,
+            pieces - left.min(*pieces),
+            pieces,
+            if *pieces == 1 { "" } else { "s" },
+            layers
+                .iter()
+                .map(|&l| board.copper[l].as_str())
+                .collect::<Vec<&str>>()
+                .join(" / "),
+            result.vias.iter().filter(|v| v.net == *net).count(),
+            if result.vias.iter().filter(|v| v.net == *net).count() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
     if result.doubled > 0 || !result.single.is_empty() {
         println!(
             "  second vias beside the vias of wide tracks: {} added{}",
@@ -630,7 +660,7 @@ fn main() {
         let text = format!(
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
              \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \"blind_vias\": {},\n  \"buried_vias\": {},\n  \
-             \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
+             \"plane_nets\": {},\n  \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
              \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
             q(&input.display().to_string()),
@@ -644,6 +674,7 @@ fn main() {
             result.vias.len(),
             blind,
             buried,
+            result.planes.len(),
             result.fanouts.len(),
             result.fanouts.iter().filter(|f| f.via.is_some()).count(),
             result.doubled,

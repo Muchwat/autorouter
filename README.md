@@ -27,6 +27,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **Length matching.** Where a rule or an option asks, a track is lengthened with meanders: square bumps on its straight sides, each one kept only if it stays clear of other nets by the track's own clearances and a track's width or more from the rest of its own net. The two halves of a differential pair are brought within their skew (a `skew` rule, or `--skew`), a net up to the least length a `length` rule asks, and a group of nets up to the longest of them (`--match-length`). Lengths come out exact, not to the nearest grid step. The router never shortens a track; a net over a rule's maximum, or with no room for its meanders, is reported with what it lacks.
 - **It says why.** A piece left unjoined comes with a reason: no clear way in at that width, shut in by other copper with so many square millimetres of room, or no path between other nets' copper.
 - **The real board shape.** The outline (lines, arcs, circles, rectangles, polygons, Bezier curves, and edge cuts inside footprints), non-plated holes and milled slots, and keep-out areas are walls. An outline that is not closed is reported, and the board is routed without it.
+- **Pads are joined to their plane.** A net with a plane on an inner layer (GND, a supply) is not routed pad to pad: each of its pads that is not on the plane yet gets a short track and a via down to it, or a track to copper of the net that is on it already where that is nearer. Which pads are on the plane is worked out from the pours as they would fill, so a pad in an outer pour that is an island apart from the plane counts as not joined. The via is blind where blind vias are allowed, and no track is laid on the plane itself. `--no-plane-vias` leaves such nets alone.
 - **Any number of copper layers.** An inner layer that a pour covers is treated as a plane and kept free of tracks, unless you pass `--tracks-on-planes`. Every track starts and ends on its pad's centre.
 - **KiCad 7 to 10 files,** both the numbered nets of KiCad 7 to 9 and the named nets of KiCad 10. Only new items are added and replaced ones cut out; the rest of the file stays byte for byte as KiCad wrote it.
 
@@ -66,6 +67,9 @@ autorouter BOARD.kicad_pcb [options]
                          go right through the board)
       --blind-vias       any blind or buried via: every pair of layers
       --via-in-pad       let vias sit on surface-mount pads of their own net
+      --no-plane-vias    leave a net that has an inner plane alone, as any net with a
+                         pour (by default each of its pads not yet on the plane is
+                         joined to it with a via)
       --no-fanout        do not bring out pads the grid cannot reach (the inner balls of
                          a BGA, tight fine-pitch pads) with an escape track or a via
       --fanout-length MM how far from its pad a fan-out may end (default 2)
@@ -98,7 +102,7 @@ The exit status is 0 when every net is joined (and, with `--drc`, KiCad finds no
 
 **Copper pours.** A zone's stored fill is only right for the copper that was there when it was poured, so once tracks change, the old fill would lie across the new tracks. The output therefore has the fills taken out: pour them again in KiCad (press B) before you plot. With `--drc`, KiCad pours the zones, checks the board and saves it, so the file you get is the file that was checked. `--keep-fills` leaves the old fills in.
 
-Nets with a copper pour (GND, usually) are left to the pour unless you pass `--include-poured`. New tracks can cut a pour into islands. The router estimates this on a fine grid and warns when pads that the pour joined before routing are cut off after it; with `--drc`, KiCad's own fill decides. Add stitching vias, or route the poured net too.
+Nets with a copper pour (GND, usually) are left to the pour unless you pass `--include-poured`; a net with an inner plane has its pads joined to the plane (see above), and `--rip` leaves its existing tracks and vias in place either way. New tracks can cut a pour into islands. The router estimates this on a fine grid and warns when pads that the pour joined before routing are cut off after it; with `--drc`, KiCad's own fill decides. Add stitching vias, or route the poured net too.
 
 **Grid.** Walls and conflicts are tested at grid points, so a track between two points can pass a little nearer to other copper than the points do. Every clearance carries a margin for that, worked out from the grid: 0.05 mm at the default 0.25 mm, more on a coarser grid (about 0.45 mm at 1 mm). A coarse grid is safe but packs tracks loosely.
 
@@ -146,6 +150,8 @@ The five boards above have no BGA: the fan-out is used for one pad on them (on t
 | Quad part, 12 pads a side at 0.4 mm, 0.15 mm rules | 35 of 48 | 44 of 48 |
 | Quad part, 16 pads a side at 0.5 mm | 64 of 64 | 64 of 64 (the grid needs none) |
 
+Joining pads to planes was tried on the vehicle tracker with every track and via of its GND and +3V3 nets taken out first (456 vias among them), which leaves 110 pads unconnected. The router joined all 165 loose pieces to the two planes, GND with 82 vias and +3V3 with 44, and KiCad then finds no pad unconnected; the two items it still lists are pieces of the front pour with no pad on them.
+
 The mains board is the case per-pair rules are for. Routed whole, mains included, it needs 8 mm from mains to low voltage and 2.5 mm between mains nets at once, which one net-class clearance cannot say. That run also comes out with 0 errors and 0 unconnected.
 
 ## Limits
@@ -157,6 +163,7 @@ The mains board is the case per-pair rules are for. Routed whole, mains included
 - **Rules on the safe side.** A condition the router can't settle makes the rule apply everywhere. A rule that exempts an area, like a courtyard, is honoured for the pads in that area but not for tracks near them.
 - **Fine-pitch parts and BGAs.** The fan-out gets a pad out; what follows still runs on the grid. Tracks pass between the vias under a BGA only where a grid line falls in the gap with room to spare, so a big BGA is not escaped in full: with through vias, about two rings of balls; with blind vias, a ring for each layer. On a 0.4 mm row with a 0.25 mm grid a few pads can still be boxed in by their neighbours' tracks; a finer grid (`--grid 0.1`) joins them. A fan-out's via is the net's ordinary via, and a pad of a differential pair that needs a fan-out is routed as a single net. Pads left over are reported; fan them out by hand, lock those tracks, and the router carries on from their ends.
 - **Plated holes of other nets** are kept clear by their pad's copper, not by a hole rule of their own. Non-plated holes and slots keep the board's hole clearance.
+- **Planes.** A pad is joined to its plane wherever a via fits near it; the router does not check that the plane's copper around that via is still in one piece with the rest (a via among many others can stand on an island), so run `--drc`. Every pad gets its own via or track, even where a pour would have joined several once one of them is on the plane. Pieces of a pour with no pad on them are not stitched to the plane, and split planes are taken by their outlines, with no account of which zone has priority where they overlap.
 - **Pours on outer layers are not planned for.** Inner planes are left whole, but on a layer it routes on the router does not steer tracks to keep a pour in one piece; it warns after the fact.
 - **Speed.** One core. A dense 4-layer board of 190 nets takes a few minutes.
 - **Check the result.** Run KiCad's DRC (or `--drc`) before you order a board. The router's own checks are on its grid; KiCad has the final word.

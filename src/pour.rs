@@ -120,6 +120,19 @@ fn copper(board: &Board, routed: Option<&Routed>) -> Vec<Copper> {
 /// For one poured net: which piece each of its pads is on (None: on no copper
 /// the grid can see), and the size of each piece.
 fn pieces(board: &Board, rules: &Rules, net: &str, items: &[Copper], gr: &Grid) -> (Vec<Option<u32>>, Vec<u32>) {
+    let (of_pad, sizes, _) = labelled(board, rules, net, items, gr);
+    (of_pad, sizes)
+}
+
+/// As `pieces`, and third: the piece each grid point is on, layer by layer
+/// (u32::MAX: none of the net's copper there).
+fn labelled(
+    board: &Board,
+    rules: &Rules,
+    net: &str,
+    items: &[Copper],
+    gr: &Grid,
+) -> (Vec<Option<u32>>, Vec<u32>, Vec<u32>) {
     let nl = board.copper.len();
     let n = gr.w * gr.h;
     // 1: copper of the net (pour or its own tracks and pads)
@@ -258,25 +271,57 @@ fn pieces(board: &Board, rules: &Rules, net: &str, items: &[Copper], gr: &Grid) 
             p.layers.iter().map(|&l| label[l * n + c]).find(|&id| id != u32::MAX)
         })
         .collect();
-    (of_pad, sizes)
+    (of_pad, sizes, label)
 }
 
-/// Pads of poured nets that the routed copper cut off from their pour.
-/// `nets`: only these (None: every net with a pour).
-pub fn cuts(board: &Board, rules: &Rules, routed: &Routed, grid: f64, nets: Option<&[String]>) -> Vec<Cut> {
-    let (bx0, by0, bx1, by1) = match board.extent() {
-        Some(e) => e,
-        None => return Vec::new(),
+/// For each pad of `net`, in the board's order: whether the net's copper as
+/// it stands (pours, tracks, vias) joins it to the plane the net has on the
+/// layers `planes`. An estimate, like the rest of this file.
+pub fn on_plane(board: &Board, rules: &Rules, net: &str, planes: &[usize], grid: f64) -> Vec<bool> {
+    let pads = board.pads.iter().filter(|p| p.net.as_deref() == Some(net)).count();
+    let gr = match fine_grid(board, grid) {
+        Some(g) => g,
+        None => return vec![false; pads],
     };
+    let (of_pad, sizes, label) = labelled(board, rules, net, &copper(board, None), &gr);
+    // the plane: the piece with the most copper on those layers
+    let n = gr.w * gr.h;
+    let mut there = vec![0u32; sizes.len()];
+    for &l in planes {
+        for id in label[l * n..(l + 1) * n].iter().filter(|id| **id != u32::MAX) {
+            there[*id as usize] += 1;
+        }
+    }
+    let plane = there
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| **k > 0)
+        .max_by_key(|(i, k)| (**k, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i as u32);
+    of_pad.iter().map(|id| id.is_some() && *id == plane).collect()
+}
+
+/// The grid the pours are worked out on.
+fn fine_grid(board: &Board, grid: f64) -> Option<Grid> {
+    let (bx0, by0, bx1, by1) = board.extent()?;
     let g = (grid / 2.0).clamp(0.05, 0.1); // fine enough to see the narrow necks a pour squeezes through
     let x0 = ((bx0 - 1.0) / g).floor() * g;
     let y0 = ((by0 - 1.0) / g).floor() * g;
-    let gr = Grid {
+    Some(Grid {
         x0,
         y0,
         g,
         w: (((bx1 + 1.0) - x0) / g).ceil() as usize + 1,
         h: (((by1 + 1.0) - y0) / g).ceil() as usize + 1,
+    })
+}
+
+/// Pads of poured nets that the routed copper cut off from their pour.
+/// `nets`: only these (None: every net with a pour).
+pub fn cuts(board: &Board, rules: &Rules, routed: &Routed, grid: f64, nets: Option<&[String]>) -> Vec<Cut> {
+    let gr = match fine_grid(board, grid) {
+        Some(g) => g,
+        None => return Vec::new(),
     };
     let before = copper(board, None);
     let after = copper(board, Some(routed));
