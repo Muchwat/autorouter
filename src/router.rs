@@ -91,6 +91,9 @@ pub struct Options {
     pub match_groups: Vec<Vec<String>>,
     /// The tallest bump of a meander, in mm.
     pub meander: f64,
+    /// Pull the tracks tight once routed: runs of corners become one straight
+    /// piece, or a diagonal and a straight, where every clearance allows.
+    pub tidy: bool,
     /// Print progress to stderr.
     pub progress: bool,
 }
@@ -127,6 +130,7 @@ impl Default for Options {
             skew: None,
             match_groups: Vec::new(),
             meander: 1.0,
+            tidy: true,
             progress: false,
         }
     }
@@ -658,6 +662,20 @@ fn recent_via(wk: &Work, s: &Search, mut st: usize, span: Span) -> bool {
 
 /// The cheapest path from any source to any target: its states, and for each
 /// the via span it was reached by (NO_VIA for a step along a layer).
+/// Ways from a to b in at most two straight pieces at multiples of 45 degrees:
+/// the straight line if it is one, else a diagonal and a straight, either way
+/// round. Each is the points after a, ending at b.
+fn octilinear(a: P, b: P) -> Vec<Vec<P>> {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let (ax, ay) = (dx.abs(), dy.abs());
+    if ax < 1e-9 || ay < 1e-9 || (ax - ay).abs() < 1e-9 {
+        return vec![vec![b]];
+    }
+    let m = ax.min(ay);
+    let d = (m * dx.signum(), m * dy.signum());
+    vec![vec![(a.0 + d.0, a.1 + d.1), b], vec![(b.0 - d.0, b.1 - d.1), b]]
+}
+
 /// The widths a narrowed piece may take, narrowest first: the neck width, then
 /// every 0.05 mm step above it, short of the full width.
 fn neck_ladder(neck: f64, full: f64) -> Vec<f64> {
@@ -2724,6 +2742,240 @@ impl<'a> Router<'a> {
     /// points to start and finish on (a pad's centre, a track's loose end) and
     /// the width of that piece, when the path's ends call for them.
     #[allow(clippy::too_many_arguments)]
+    /// Pull job j's tracks tight: wherever a run of corners can be replaced by
+    /// one straight piece, or a diagonal and a straight, that keeps every
+    /// clearance (measured exactly, not on the grid), it is. Junctions, vias and
+    /// the ends of each track stay where they are. Returns the corners taken
+    /// out and the length saved.
+    fn tidy(&mut self, j: usize) -> (usize, f64) {
+        let laid = match &self.laid[j] {
+            Some(l) => l.clone(),
+            None => return (0, 0.0),
+        };
+        let net = self.jobs[j].net.clone();
+        let edge = self.rules.edge_clearance(&net);
+        let layered = self.rules.layered();
+        // other nets' new copper: (layer, a, b, half width, net) and (at, span, diameter, drill, net)
+        let mut segs: Vec<(usize, P, P, f64, String)> = Vec::new();
+        let mut holes: Vec<(P, Span, f64, f64, String)> = Vec::new();
+        for (k, other) in self.laid.iter().enumerate() {
+            let other = match other {
+                Some(o) if k != j && self.active[k] => o,
+                _ => continue,
+            };
+            let pos = self.jobs[k].net.clone();
+            let neg = self.jobs[k]
+                .pair
+                .as_ref()
+                .map(|p| p.net_n.clone())
+                .unwrap_or_else(|| pos.clone());
+            if pos == net && neg == net {
+                continue;
+            }
+            for (list, name) in [(&other.tracks, &pos), (&other.tracks_n, &neg)] {
+                if *name == net {
+                    continue;
+                }
+                for (l, pts, w) in list {
+                    for s in pts.windows(2) {
+                        segs.push((*l, s[0], s[1], w / 2.0, name.clone()));
+                    }
+                }
+            }
+            if let Some((d, h)) = self.jobs[k].via {
+                for &(at, span) in &other.vias {
+                    holes.push((at, span, d, h, pos.clone()));
+                }
+                for &(at, negative, span) in &other.real_vias {
+                    let name = if negative { &neg } else { &pos };
+                    if *name != net {
+                        holes.push((at, span, d, h, name.clone()));
+                    }
+                }
+            }
+        }
+        // where the net's own copper meets: every end of its tracks, and its vias
+        let mut pins: Vec<(usize, P)> = Vec::new();
+        for (l, pts, _) in &laid.tracks {
+            pins.push((*l, pts[0]));
+            pins.push((*l, pts[pts.len() - 1]));
+        }
+        for &(at, (a, b)) in &laid.vias {
+            for l in a..=b {
+                pins.push((l, at));
+            }
+        }
+        let keepouts: Vec<(Vec<usize>, Vec<P>)> = self
+            .board
+            .zones
+            .iter()
+            .filter(|z| z.keepout.as_ref().map(|k| k.tracks).unwrap_or(false))
+            .map(|z| (z.layers.clone(), z.outline.clone()))
+            .collect();
+
+        let mut tracks: Vec<(usize, Vec<P>, f64)> = Vec::new();
+        let (mut corners, mut saved) = (0usize, 0.0f64);
+        for (l, pts, w) in &laid.tracks {
+            let (l, w) = (*l, *w);
+            if pts.len() < 3 {
+                tracks.push((l, pts.clone(), w));
+                continue;
+            }
+            let hw = w / 2.0;
+            // the pins on this track become corners of their own, and split it
+            let mut full: Vec<P> = vec![pts[0]];
+            for s in pts.windows(2) {
+                let mut on: Vec<(f64, P)> = pins
+                    .iter()
+                    .filter(|(pl, p)| {
+                        *pl == l
+                            && geom::seg_dist(*p, s[0], s[1]) < 1e-6
+                            && geom::dist(*p, s[0]) > 1e-6
+                            && geom::dist(*p, s[1]) > 1e-6
+                    })
+                    .map(|(_, p)| (geom::dist(*p, s[0]), *p))
+                    .collect();
+                on.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                full.extend(on.into_iter().map(|(_, p)| p));
+                full.push(s[1]);
+            }
+            let fixed: Vec<bool> = full
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    i == 0 || i + 1 == full.len() || pins.iter().any(|(pl, q)| *pl == l && geom::dist(*p, *q) < 1e-6)
+                })
+                .collect();
+            let mut out: Vec<P> = vec![full[0]];
+            let mut start = 0;
+            for end in 1..full.len() {
+                if !fixed[end] {
+                    continue;
+                }
+                let piece = &full[start..=end];
+                start = end;
+                if piece.len() < 3 {
+                    out.extend_from_slice(&piece[1..]);
+                    continue;
+                }
+                // what this piece could come near: anything near its bounding box (a
+                // shortcut never leaves the box of its two ends)
+                let bb = piece.iter().fold(
+                    (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+                    |b, p| (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1)),
+                );
+                let near = self.near(j, bb, hw);
+                let on = if layered { Some(self.layer(l)) } else { None };
+                let mut walls: Vec<(P, P, f64)> = Vec::new();
+                for (sl, a, b, shw, other) in &segs {
+                    if *sl != l {
+                        continue;
+                    }
+                    let need = self
+                        .rules
+                        .clearance(&Item::track(&net).on(on), &Item::track(other).on(on))
+                        + hw
+                        + shw;
+                    if a.0.min(b.0) - bb.2 > need
+                        || bb.0 - a.0.max(b.0) > need
+                        || a.1.min(b.1) - bb.3 > need
+                        || bb.1 - a.1.max(b.1) > need
+                    {
+                        continue;
+                    }
+                    walls.push((*a, *b, need));
+                }
+                for (at, (sa, sb), d, h, other) in &holes {
+                    if l < *sa || l > *sb {
+                        continue;
+                    }
+                    let need = (self
+                        .rules
+                        .clearance(&Item::track(&net).on(on), &Item::via(other).on(on))
+                        + d / 2.0)
+                        .max(self.rules.hole_clearance + h / 2.0)
+                        + hw;
+                    if at.0 - bb.2 > need || bb.0 - at.0 > need || at.1 - bb.3 > need || bb.1 - at.1 > need {
+                        continue;
+                    }
+                    walls.push((*at, *at, need));
+                }
+                let clear = |r: &Self, a: P, b: P| -> bool {
+                    r.stub_ok(hw, a, b, l, &near, edge)
+                        && walls
+                            .iter()
+                            .all(|&(c, d, need)| geom::seg_seg_dist(a, b, c, d) >= need - 1e-6)
+                        && keepouts.iter().all(|(ls, poly)| {
+                            !ls.contains(&l)
+                                || (!geom::in_polygon(a, poly)
+                                    && !geom::in_polygon(b, poly)
+                                    && (0..poly.len()).all(|i| {
+                                        geom::seg_seg_dist(a, b, poly[i], poly[(i + 1) % poly.len()]) > hw + 1e-6
+                                    }))
+                        })
+                };
+                let length = |p: &[P]| p.windows(2).map(|s| geom::dist(s[0], s[1])).sum::<f64>();
+                let mut i = 0;
+                while i + 1 < piece.len() {
+                    let mut took = false;
+                    for k in ((i + 2)..piece.len()).rev() {
+                        let was = length(&piece[i..=k]);
+                        for way in octilinear(piece[i], piece[k]) {
+                            let mut cand = vec![piece[i]];
+                            cand.extend_from_slice(&way);
+                            let now = length(&cand);
+                            let fewer = cand.len() < k - i + 1;
+                            if now > was + 1e-9 || (!fewer && now > was - 1e-6) {
+                                continue;
+                            }
+                            if cand.windows(2).all(|s| clear(self, s[0], s[1])) {
+                                corners += (k - i + 1) - cand.len();
+                                saved += was - now;
+                                out.extend_from_slice(&cand[1..]);
+                                i = k;
+                                took = true;
+                                break;
+                            }
+                        }
+                        if took {
+                            break;
+                        }
+                    }
+                    if !took {
+                        out.push(piece[i + 1]);
+                        i += 1;
+                    }
+                }
+            }
+            // straight runs that now meet end to end become one (pins stay)
+            let mut simp: Vec<P> = Vec::new();
+            for p in out {
+                if simp.last().map(|q: &P| geom::dist(*q, p) < 1e-6).unwrap_or(false) {
+                    continue;
+                }
+                if simp.len() >= 2 {
+                    let (a, b) = (simp[simp.len() - 2], simp[simp.len() - 1]);
+                    let pinned = pins.iter().any(|(pl, q)| *pl == l && geom::dist(b, *q) < 1e-6);
+                    if !pinned
+                        && ((b.0 - a.0) * (p.1 - b.1) - (b.1 - a.1) * (p.0 - b.0)).abs() < 1e-9
+                        && (b.0 - a.0) * (p.0 - b.0) + (b.1 - a.1) * (p.1 - b.1) >= 0.0
+                    {
+                        simp.pop();
+                    }
+                }
+                simp.push(p);
+            }
+            tracks.push((l, simp, w));
+        }
+        if corners > 0 {
+            self.add(j, -1);
+            self.laid[j].as_mut().unwrap().tracks = tracks;
+            self.contrib[j].clear();
+            self.add(j, 1);
+        }
+        (corners, saved)
+    }
+
     fn geometry(
         &self,
         path: &[u32],
@@ -3884,6 +4136,20 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
         }
     }
 
+    // tracks pulled tight, before lengths are tuned and second vias placed (a pair,
+    // or a net routed in stretches by several jobs, keeps its tracks as they are)
+    if opt.tidy {
+        let (mut corners, mut saved) = (0, 0.0);
+        for j in 0..nj {
+            if r.active[j] && r.jobs[j].pair.is_none() && r.sibs[j].is_empty() {
+                let (c, s) = r.tidy(j);
+                corners += c;
+                saved += s;
+            }
+        }
+        r.say(format!("  tidied: {} corners fewer, {:.1} mm shorter", corners, saved));
+    }
+
     // lengths: the halves of a pair to within their skew, nets up to the least
     // length a rule asks, and groups up to their longest
     {
@@ -4260,6 +4526,83 @@ mod tests {
         }
         s += "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
         Board::parse(s).unwrap()
+    }
+
+    #[test]
+    fn two_pieces_at_45_degrees_join_any_two_points() {
+        assert_eq!(octilinear((0.0, 0.0), (3.0, 0.0)), vec![vec![(3.0, 0.0)]]);
+        assert_eq!(octilinear((0.0, 0.0), (2.0, -2.0)), vec![vec![(2.0, -2.0)]]);
+        let ways = octilinear((0.0, 0.0), (5.0, 2.0));
+        assert_eq!(ways, vec![vec![(2.0, 2.0), (5.0, 2.0)], vec![(3.0, 0.0), (5.0, 2.0)]]);
+    }
+
+    /// Nets that cross each other's way, so the grid search bends round.
+    fn tangle() -> Board {
+        let mut s = String::from(HEAD);
+        let ends = [
+            ("A", (1.0, 2.0), (39.0, 27.0)),
+            ("B", (1.0, 27.0), (39.0, 2.0)),
+            ("C", (20.0, 1.0), (20.0, 28.0)),
+            ("D", (1.0, 14.0), (39.0, 15.0)),
+            ("E", (8.0, 1.0), (31.0, 28.0)),
+            ("F", (31.0, 1.0), (8.0, 28.0)),
+        ];
+        for (k, (net, a, b)) in ends.iter().enumerate() {
+            s += &smd(&format!("J{}a", k), net, a.0, a.1, 0.8, 0.8);
+            s += &smd(&format!("J{}b", k), net, b.0, b.1, 0.8, 0.8);
+        }
+        // other nets' pads in the way, which a straightened track must still go round
+        for (k, (x, y)) in [(14.0, 8.0), (26.0, 8.0), (14.0, 21.0), (26.0, 21.0), (20.0, 14.5)]
+            .iter()
+            .enumerate()
+        {
+            s += &smd(&format!("X{}", k), &format!("X{}", k), *x, *y, 3.0, 3.0);
+        }
+        s += "(gr_rect (start 0 0) (end 40 29) (layer \"Edge.Cuts\")))";
+        Board::parse(s).unwrap()
+    }
+
+    #[test]
+    fn tidying_takes_out_corners_and_keeps_every_clearance() {
+        let b = tangle();
+        let raw = route(
+            &b,
+            &rules(),
+            &Options {
+                tidy: false,
+                ..Options::default()
+            },
+        );
+        let tidy = route(&b, &rules(), &Options::default());
+        assert!(raw.complete() && tidy.complete(), "{:?}", tidy.nets);
+        let length = |r: &Routed| r.tracks.iter().map(|t| geom::dist(t.a, t.b)).sum::<f64>();
+        assert!(
+            tidy.tracks.len() < raw.tracks.len(),
+            "{} pieces, {} before",
+            tidy.tracks.len(),
+            raw.tracks.len()
+        );
+        assert!(length(&tidy) <= length(&raw) + 1e-6);
+        assert!(
+            smallest_gap(&b, &tidy) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &tidy)
+        );
+        for net in ["A", "B", "C", "D", "E", "F"] {
+            assert!(kicad_joined(&b, &tidy, net), "{} is not joined as KiCad counts it", net);
+        }
+        // every piece still runs at a multiple of 45 degrees, but where it meets a pad's centre
+        let centres: Vec<P> = b.pads.iter().map(|p| p.shape.centre()).collect();
+        for t in &tidy.tracks {
+            let (dx, dy) = ((t.b.0 - t.a.0).abs(), (t.b.1 - t.a.1).abs());
+            let square = dx < 1e-6 || dy < 1e-6 || (dx - dy).abs() < 1e-6;
+            let at_pad = centres
+                .iter()
+                .any(|c| geom::dist(*c, t.a) < 1e-6 || geom::dist(*c, t.b) < 1e-6);
+            assert!(square || at_pad, "{:?} to {:?}", t.a, t.b);
+        }
+        // and the same every time
+        assert_eq!(route(&b, &rules(), &Options::default()).tracks, tidy.tracks);
     }
 
     #[test]

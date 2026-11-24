@@ -88,6 +88,8 @@ autorouter BOARD.kicad_pcb [options]
       --meander MM       the tallest bump of a meander (default 1)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
+      --no-tidy          leave the tracks as the grid search laid them (by default runs of
+                         corners are pulled straight where every clearance allows)
       --report FILE      write what was done as JSON (for scripts and benchmarks), with
                          every track and via added and the nets whose tracks were taken up
       --via-cost N       what a via costs, in grid steps (default 12)
@@ -171,7 +173,7 @@ The mains board is the case per-pair rules are for. Routed whole, mains included
 
 ## Limits
 
-- **A grid router.** Tracks run on a grid (0.25 mm by default) in 45-degree steps. There is no push-and-shove and no smoothing of the result.
+- **A grid router.** Tracks run on a grid (0.25 mm by default) in 45-degree steps. There is no push-and-shove. Once routed, each track is pulled tight where every clearance allows (`--no-tidy` leaves it as the search laid it), but it keeps the path the search chose: a detour stays a detour, only straighter. Differential pairs, and nets routed in stretches, are not pulled tight.
 - **Lengths.** A net's length is the sum of its tracks (those the board had and the new ones); vias and the path inside pads are not counted, and a net of more than two pads is measured as a whole, not pad to pad. Length and skew rules are followed only where their condition holds for certain. Meanders are square-cornered. A pair's skew is made up with bumps on its shorter half wherever there is room, not necessarily next to the bend that caused it.
 - **Pad shapes.** Custom pad shapes are taken as their bounding box, and trapezoids as their enclosing rectangle. That is safe but can block more than it needs to.
 - **Blind and buried vias are yours to name.** The router does not know how your board is built up, so it uses only the spans you give it; ask your board house which they make before you pass `--blind-vias`. A blind or buried via is the same size as the net's through via. There are no micro vias, and the router does not stack or stagger vias on purpose.
@@ -192,7 +194,9 @@ The mains board is the case per-pair rules are for. Routed whole, mains included
 4. **Walls** for each job: the outline and keep-outs, and every other net's pads, holes and existing copper, each grown by the clearance that pair of nets needs plus half the job's track width.
 5. **Route** each job as a tree, piece by piece, with A* on the grid. Other jobs' new copper costs more where it is crowded, and more again where it has been fought over before.
 6. **Negotiate.** Find the jobs whose copper sits inside another's clearance, raise the costs, and route only those again, until none are left or progress stops.
-7. **Settle** anything still in conflict with the others as walls, then write the tracks and vias.
+7. **Settle** anything still in conflict with the others as walls.
+8. **Pull tight** each net's tracks: a run of corners becomes one straight piece, or a diagonal and a straight, wherever that keeps every clearance, measured exactly against the copper, holes, outline and keep-outs. Junctions and vias stay put.
+9. **Lengths and vias:** meanders where a length or skew rule asks, a second via beside each via on wide tracks, then write the tracks and vias.
 
 Nets that every rule treats alike (same net class and same answer to every net-name test in the rules) share one occupancy map, so a board with many nets stays fast while each pair of nets still gets its own clearance.
 

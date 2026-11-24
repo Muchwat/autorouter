@@ -53,6 +53,8 @@ usage: autorouter BOARD.kicad_pcb [options]
       --meander MM       the tallest bump of a meander (default 1)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
+      --no-tidy          leave the tracks as the grid search laid them (by default runs of
+                         corners are pulled straight where every clearance allows)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
       --via-cost N       what a via costs, in grid steps (default 12)
       --passes N         most negotiation passes (default 40)
@@ -240,6 +242,7 @@ fn main() {
                 opt.via = Some((mm(d, "--via"), mm(h, "--via")));
             }
             "--no-vias" => opt.no_vias = true,
+            "--no-tidy" => opt.tidy = false,
             "--tracks-on-planes" => opt.tracks_on_planes = true,
             "--via-in-pad" => opt.via_in_pad = true,
             "--no-diff-pairs" => opt.diff_pairs = false,
