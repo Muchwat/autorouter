@@ -604,6 +604,9 @@ impl Work {
 }
 
 const SQRT2: f64 = std::f64::consts::SQRT_2;
+/// How many grid steps beyond the least distance a second via may stand from the first.
+const DOUBLE_SPARE: i64 = 4;
+
 const DIRS: [(i64, i64, f64); 8] = [
     (1, 0, 1.0),
     (-1, 0, 1.0),
@@ -643,6 +646,9 @@ struct Search<'a> {
     hist: &'a [Vec<f32>],
     pres: f64,
     via_cost: f64,
+    /// Per cell: 1 where a via would leave no room for the second via this job's
+    /// vias get, so a via there costs twice.
+    cramped: Option<&'a [u8]>,
     limit: usize,
 }
 
@@ -789,7 +795,10 @@ fn astar(
                 }
                 let hsum: f64 = (a..=b).map(|x| s.hist[x][idx] as f64).sum();
                 let near: u32 = (a..=b).map(|x| s.soft_via[x][idx] as u32).sum();
-                let ng = gc + s.via_cost * (1.0 + hsum) * (1.0 + s.pres * near as f64);
+                let mut ng = gc + s.via_cost * (1.0 + hsum) * (1.0 + s.pres * near as f64);
+                if s.cramped.map(|c| c[idx] != 0).unwrap_or(false) {
+                    ng += s.via_cost;
+                }
                 for l2 in a..=b {
                     if l2 != l && s.block[l2][idx] == 0 {
                         relax(wk, l2 * n + idx, ng, k as u8);
@@ -816,6 +825,9 @@ struct Router<'a> {
     entries: Vec<Option<Vec<Vec<Entry2>>>>,
     /// job -> state -> size of the free region it is in
     rooms: Vec<Option<std::rc::Rc<Vec<u32>>>>,
+    /// job -> cell -> 1 where a via would have no room for a second beside it
+    /// (worked out once, from the walls; only for jobs whose vias get a second)
+    cramped: Vec<Option<std::rc::Rc<Vec<u8>>>>,
     /// job -> obstacle -> the clearance the job's tracks owe it (worked out once, in hard())
     owed: Vec<Vec<f32>>,
     laid: Vec<Option<Laid>>,
@@ -1940,6 +1952,268 @@ impl<'a> Router<'a> {
         total
     }
 
+    /// For a job whose vias get a second beside them: per cell, 1 where a via
+    /// would have no room for it as the walls stand (the board's copper, holes,
+    /// outline and keep-outs; other jobs' new copper may take more later), so the
+    /// search can prefer places with room. None for other jobs.
+    fn cramped(&mut self, j: usize) -> Option<std::rc::Rc<Vec<u8>>> {
+        if let Some(c) = &self.cramped[j] {
+            return Some(c.clone());
+        }
+        let jb = &self.jobs[j];
+        let drill = match jb.via {
+            Some(v) => v.1,
+            None => return None,
+        };
+        if self.opt.double_vias <= 0.0 || jb.pair.is_some() || jb.width < self.opt.double_vias - 1e-9 {
+            return None;
+        }
+        let (block, vblock) = self.hard(j);
+        let vb = vblock?;
+        let (n, nl, g, w, h) = (self.gr.n, self.gr.nl, self.gr.g, self.gr.w as i64, self.gr.h as i64);
+        let routes: Vec<usize> = (0..nl).filter(|&l| self.layers_ok(l)).collect();
+        let apart = drill + self.rules.hole_to_hole;
+        let straight = (apart / g - 1e-9).ceil().max(1.0) as i64;
+        let diagonal = (apart / (g * SQRT2) - 1e-9).ceil().max(1.0) as i64;
+        let mut out = vec![0u8; n];
+        for c in 0..n {
+            if (0..nl).any(|l| vb[l][c] != 0) {
+                continue; // no via here anyway
+            }
+            let (ci, cj) = ((c as i64) % w, (c as i64) / w);
+            let roomy = (0..=DOUBLE_SPARE).any(|extra| {
+                DIRS.iter().any(|&(di, dj, _)| {
+                    let k = extra + if di != 0 && dj != 0 { diagonal } else { straight };
+                    let (i2, j2) = (ci + di * k, cj + dj * k);
+                    if i2 < 0 || i2 >= w || j2 < 0 || j2 >= h {
+                        return false;
+                    }
+                    let c2 = (j2 * w + i2) as usize;
+                    (0..nl).all(|l| vb[l][c2] == 0)
+                        && routes
+                            .iter()
+                            .all(|&l| (0..=k).all(|t| block[l][((cj + dj * t) * w + ci + di * t) as usize] == 0))
+                })
+            });
+            if !roomy {
+                out[c] = 1;
+            }
+        }
+        let out = std::rc::Rc::new(out);
+        self.cramped[j] = Some(out.clone());
+        Some(out)
+    }
+
+    /// Whether a via of job j at p, joining layers a..=b, keeps every clearance,
+    /// measured exactly: to other nets' copper (the board's and the new), the
+    /// outline, keep-outs that forbid vias, and the net's own surface-mount pads
+    /// (unless vias may sit in pads). Holes of its own net are the caller's to check.
+    fn via_fits(&mut self, j: usize, p: P, (a, b): Span) -> bool {
+        let (d, h) = match self.jobs[j].via {
+            Some(v) => v,
+            None => return false,
+        };
+        let net = self.jobs[j].net.clone();
+        let layered = self.rules.layered();
+        let r = d / 2.0;
+        // the outline
+        let edge = self.rules.edge_clearance(&net) + r;
+        if self
+            .board
+            .edges
+            .iter()
+            .any(|&(c, e)| geom::seg_dist(p, c, e) < edge - 1e-6)
+        {
+            return false;
+        }
+        // keep-outs
+        for z in &self.board.zones {
+            if z.keepout.as_ref().map(|k| k.vias).unwrap_or(false)
+                && z.layers.iter().any(|&l| l >= a && l <= b)
+                && (geom::in_polygon(p, &z.outline) || geom::polygon_edge_dist(p, &z.outline) < r + 1e-6)
+            {
+                return false;
+            }
+        }
+        // the board's copper and holes
+        for ob in &self.obstacles {
+            if !ob.layers.iter().any(|&l| l >= a && l <= b) {
+                continue;
+            }
+            let own = ob.net.as_deref() == Some(net.as_str());
+            if own {
+                // its own pads: not into a surface-mount one, unless asked
+                if ob.kind == "Pad"
+                    && ob.layers.len() < self.gr.nl
+                    && !self.opt.via_in_pad
+                    && ob.shape.dist(p) < h / 2.0 + 0.05
+                {
+                    return false;
+                }
+                continue;
+            }
+            let bb = ob.shape.bbox();
+            if p.0 < bb.0 - 5.0 || p.0 > bb.2 + 5.0 || p.1 < bb.1 - 5.0 || p.1 > bb.3 + 5.0 {
+                continue;
+            }
+            for &l in ob.layers.iter().filter(|&&l| l >= a && l <= b) {
+                let other = Item {
+                    net: ob.net.as_deref(),
+                    kind: Some(ob.kind),
+                    shape: Some(&ob.shape),
+                    layer: if layered { Some(self.layer(l)) } else { None },
+                    paired: None,
+                };
+                let me = Item::via(&net).on(if layered { Some(self.layer(l)) } else { None });
+                let need = self.rules.clearance(&me, &other).max(ob.least) + r;
+                if ob.shape.dist(p) < need - 1e-6 {
+                    return false;
+                }
+            }
+        }
+        // other nets' new copper
+        for k in 0..self.laid.len() {
+            if k == j || !self.active[k] {
+                continue;
+            }
+            let other = match &self.laid[k] {
+                Some(o) => o.clone(),
+                None => continue,
+            };
+            let pos = self.jobs[k].net.clone();
+            let neg = self.jobs[k]
+                .pair
+                .as_ref()
+                .map(|q| q.net_n.clone())
+                .unwrap_or_else(|| pos.clone());
+            for (list, name) in [(&other.tracks, &pos), (&other.tracks_n, &neg)] {
+                if *name == net {
+                    continue;
+                }
+                for (l, pts, w) in list {
+                    if *l < a || *l > b {
+                        continue;
+                    }
+                    let on = if layered { Some(self.layer(*l)) } else { None };
+                    let need = self.rules.clearance(&Item::via(&net).on(on), &Item::track(name).on(on)) + r + w / 2.0;
+                    if pts.windows(2).any(|s| geom::seg_dist(p, s[0], s[1]) < need - 1e-6) {
+                        return false;
+                    }
+                }
+            }
+            if let Some((d2, h2)) = self.jobs[k].via {
+                let mut theirs: Vec<(P, Span, String)> = other.vias.iter().map(|v| (v.0, v.1, pos.clone())).collect();
+                theirs.extend(
+                    other
+                        .real_vias
+                        .iter()
+                        .map(|v| (v.0, v.2, if v.1 { neg.clone() } else { pos.clone() })),
+                );
+                for (at, (sa, sb), name) in theirs {
+                    if name == net || sb < a || sa > b {
+                        continue;
+                    }
+                    let need = (self.rules.clearance(&Item::via(&net), &Item::via(&name)) + r + d2 / 2.0)
+                        .max(self.rules.hole_to_hole + (h + h2) / 2.0);
+                    if geom::dist(p, at) < need - 1e-6 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether a track of job j from a to b on layer l, hw half wide, keeps every
+    /// clearance, measured exactly: to other nets' copper (the board's and the
+    /// new), holes, the outline and keep-outs that forbid tracks.
+    fn track_fits(&mut self, j: usize, l: usize, a: P, b: P, hw: f64) -> bool {
+        let net = self.jobs[j].net.clone();
+        let edge = self.rules.edge_clearance(&net);
+        let bb = (a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1));
+        let near = self.near(j, bb, hw);
+        if !self.stub_ok(hw, a, b, l, &near, edge) {
+            return false;
+        }
+        for z in &self.board.zones {
+            if z.keepout.as_ref().map(|k| k.tracks).unwrap_or(false)
+                && z.layers.contains(&l)
+                && (geom::in_polygon(a, &z.outline)
+                    || geom::in_polygon(b, &z.outline)
+                    || (0..z.outline.len()).any(|i| {
+                        geom::seg_seg_dist(a, b, z.outline[i], z.outline[(i + 1) % z.outline.len()]) <= hw + 1e-6
+                    }))
+            {
+                return false;
+            }
+        }
+        let on = if self.rules.layered() {
+            Some(self.layer(l))
+        } else {
+            None
+        };
+        for k in 0..self.laid.len() {
+            if k == j || !self.active[k] {
+                continue;
+            }
+            let other = match &self.laid[k] {
+                Some(o) => o.clone(),
+                None => continue,
+            };
+            let pos = self.jobs[k].net.clone();
+            let neg = self.jobs[k]
+                .pair
+                .as_ref()
+                .map(|q| q.net_n.clone())
+                .unwrap_or_else(|| pos.clone());
+            for (list, name) in [(&other.tracks, &pos), (&other.tracks_n, &neg)] {
+                if *name == net {
+                    continue;
+                }
+                for (tl, pts, w) in list {
+                    if *tl != l {
+                        continue;
+                    }
+                    let need = self
+                        .rules
+                        .clearance(&Item::track(&net).on(on), &Item::track(name).on(on))
+                        + hw
+                        + w / 2.0;
+                    if pts
+                        .windows(2)
+                        .any(|s| geom::seg_seg_dist(a, b, s[0], s[1]) < need - 1e-6)
+                    {
+                        return false;
+                    }
+                }
+            }
+            if let Some((d2, h2)) = self.jobs[k].via {
+                let mut theirs: Vec<(P, Span, String)> = other.vias.iter().map(|v| (v.0, v.1, pos.clone())).collect();
+                theirs.extend(
+                    other
+                        .real_vias
+                        .iter()
+                        .map(|v| (v.0, v.2, if v.1 { neg.clone() } else { pos.clone() })),
+                );
+                for (at, (sa, sb), name) in theirs {
+                    if name == net || l < sa || l > sb {
+                        continue;
+                    }
+                    let need = (self
+                        .rules
+                        .clearance(&Item::track(&net).on(on), &Item::via(&name).on(on))
+                        + d2 / 2.0)
+                        .max(self.rules.hole_clearance + h2 / 2.0)
+                        + hw;
+                    if geom::seg_dist(at, a, b) < need - 1e-6 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Put a second via beside each via of job j, joined to the first on every
     /// layer the net has a track at it: one small via is the weak point of a wide
     /// track. Returns (added, vias left single).
@@ -1972,10 +2246,17 @@ impl<'a> Router<'a> {
         }
         let straight = (apart / g - 1e-9).ceil().max(1.0) as i64;
         let diagonal = (apart / (g * SQRT2) - 1e-9).ceil().max(1.0) as i64;
+        // every way out, at the least distance and up to DOUBLE_SPARE grid steps beyond it
+        // (where the nearest spot is taken, one a little further often is not),
+        // nearest first
         let mut steps: Vec<(i64, i64, i64)> = Vec::new(); // (di, dj, cells)
-        for &(di, dj, _) in DIRS.iter() {
-            steps.push((di, dj, if di != 0 && dj != 0 { diagonal } else { straight }));
+        for extra in 0..=DOUBLE_SPARE {
+            for &(di, dj, _) in DIRS.iter() {
+                steps.push((di, dj, extra + if di != 0 && dj != 0 { diagonal } else { straight }));
+            }
         }
+        let reach = |&(di, dj, k): &(i64, i64, i64)| ((di * di + dj * dj) as f64).sqrt() * k as f64;
+        steps.sort_by(|a, b| reach(a).partial_cmp(&reach(b)).unwrap());
         let mut new_tracks: Vec<(usize, Vec<P>, f64)> = Vec::new();
         let mut new_vias: Vec<ViaAt> = Vec::new();
         let mut single: Vec<P> = Vec::new();
@@ -1996,21 +2277,23 @@ impl<'a> Router<'a> {
                     continue;
                 }
                 let c2 = (jj * w + i) as usize;
-                if (a..=b).any(|l| vblock[l][c2] != 0 || sv[l][c2] != 0) {
-                    continue;
-                }
                 let p2 = self.gr.xy(c2);
                 if holes.iter().any(|h| geom::dist(*h, p2) < apart - 1e-9) {
                     continue;
                 }
-                // the link between the two, on each layer, over free cells only
-                let clear = layers.iter().all(|&l| {
-                    (0..=k).all(|t| {
-                        let cc = ((c / w + dj * t) * w + (c % w + di * t)) as usize;
-                        block[l][cc] == 0 && soft[l][cc] == 0
-                    })
-                });
-                if !clear {
+                // free on the grid, the link over free cells only; or, where the grid's
+                // margins say no, room as measured exactly
+                let on_grid = !(a..=b).any(|l| vblock[l][c2] != 0 || sv[l][c2] != 0)
+                    && layers.iter().all(|&l| {
+                        (0..=k).all(|t| {
+                            let cc = ((c / w + dj * t) * w + (c % w + di * t)) as usize;
+                            block[l][cc] == 0 && soft[l][cc] == 0
+                        })
+                    });
+                if !on_grid
+                    && !(self.via_fits(j, p2, (a, b))
+                        && layers.iter().all(|&l| self.track_fits(j, l, p, p2, widths[l] / 2.0)))
+                {
                     continue;
                 }
                 for &l in &layers {
@@ -2370,6 +2653,7 @@ impl<'a> Router<'a> {
                     hist: &hist,
                     pres,
                     via_cost: search_via,
+                    cramped: None,
                     limit,
                 };
                 match astar(&self.gr, &mut self.work, &search, &gates[k], &gates[k + 1], mid) {
@@ -2549,6 +2833,7 @@ impl<'a> Router<'a> {
                 .ok()
                 .and_then(|k| entries[t][k].1)
         };
+        let cramped = self.cramped(j);
         let room = self.room(j);
         let terms = self.jobs[j].terminals.len();
         let centre = |t: usize| -> P { self.jobs[j].terminals[t].centre };
@@ -2614,6 +2899,7 @@ impl<'a> Router<'a> {
                 hist: &hist,
                 pres,
                 via_cost: search_via,
+                cramped: cramped.as_deref().map(|v| v.as_slice()),
                 limit,
             };
             let found = if plane.is_empty() {
@@ -3901,6 +4187,7 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
         hard: (0..nj).map(|_| None).collect(),
         entries: (0..nj).map(|_| None).collect(),
         rooms: (0..nj).map(|_| None).collect(),
+        cramped: (0..nj).map(|_| None).collect(),
         owed: vec![Vec::new(); nj],
         laid: vec![None; nj],
         contrib: vec![HashMap::new(); nj],
