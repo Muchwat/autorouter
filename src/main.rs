@@ -18,6 +18,9 @@ usage: autorouter BOARD.kicad_pcb [options]
       --include-poured   also route nets that have a copper pour (left to the pour by default)
       --rip              remove the existing tracks and vias of the nets being routed first
                          (locked ones stay)
+      --keep-widths      route each net at the width its tracks on the board mostly have
+                         (by length), not the rules' width; with --rip, the width of the
+                         tracks taken up. Nets with no tracks yet follow the rules
       --layers F.Cu,B.Cu copper layers to use (default: all)
       --grid MM          grid pitch (default 0.25; 0.254 suits 0.1 inch through-hole parts)
       --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
@@ -201,6 +204,7 @@ fn main() {
     let (mut input, mut output, mut rip, mut check, mut quiet, mut keep_fills) =
         (None::<PathBuf>, None::<PathBuf>, false, false, false, false);
     let mut report: Option<PathBuf> = None;
+    let mut keep_widths = false;
     let mut layer_names: Option<Vec<String>> = None;
     let mut span_names: Vec<String> = Vec::new();
     let mut any_span = false;
@@ -219,6 +223,7 @@ fn main() {
             "--skip" => opt.skip = list(&value(&mut i, &a)),
             "--include-poured" | "--include-zone-nets" => opt.include_poured = true,
             "--rip" => rip = true,
+            "--keep-widths" => keep_widths = true,
             "--layers" => layer_names = Some(list(&value(&mut i, &a))),
             "--via-spans" => span_names.extend(list(&value(&mut i, &a))),
             "--blind-vias" => any_span = true,
@@ -361,6 +366,9 @@ fn main() {
         eprintln!("note: {}", n);
     }
 
+    if keep_widths {
+        opt.kept_widths = router::board_widths(&board, &opt);
+    }
     let mut removed = 0;
     // the nets whose unlocked tracks and vias were taken out (for the report: a
     // plugin that adds the result to an open board takes out the same)

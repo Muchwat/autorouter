@@ -91,6 +91,10 @@ pub struct Options {
     pub match_groups: Vec<Vec<String>>,
     /// The tallest bump of a meander, in mm.
     pub meander: f64,
+    /// Widths to route these nets at in place of the rules' (each no thinner than
+    /// the rules' least): the widths the board's own tracks had, from
+    /// `board_widths`, so a net taken up and routed again keeps its width.
+    pub kept_widths: BTreeMap<String, f64>,
     /// Pull the tracks tight once routed: runs of corners become one straight
     /// piece, or a diagonal and a straight, where every clearance allows.
     pub tidy: bool,
@@ -130,6 +134,7 @@ impl Default for Options {
             skew: None,
             match_groups: Vec::new(),
             meander: 1.0,
+            kept_widths: BTreeMap::new(),
             tidy: true,
             progress: false,
         }
@@ -3090,6 +3095,28 @@ pub fn wanted(board: &Board, opt: &Options, net: &str) -> bool {
     opt.include_poured || !board.poured_nets().iter().any(|p| p == net)
 }
 
+/// The width each net's tracks on the board mostly have, by length: for the
+/// nets that would be routed, from their tracks as they are now (locked or not).
+/// Given as `Options::kept_widths`, a net taken up and routed again keeps it.
+pub fn board_widths(board: &Board, opt: &Options) -> BTreeMap<String, f64> {
+    let mut by: BTreeMap<String, BTreeMap<i64, f64>> = BTreeMap::new();
+    for t in &board.tracks {
+        if let Some(net) = t.net.as_deref() {
+            if wanted(board, opt, net) {
+                *by.entry(net.to_string()).or_default().entry(um(t.width)).or_insert(0.0) += geom::dist(t.a, t.b);
+            }
+        }
+    }
+    by.into_iter()
+        .filter_map(|(net, ws)| {
+            // the longest; of two as long, the wider
+            ws.into_iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(a.0.cmp(&b.0)))
+                .map(|(w, _)| (net, w as f64 / 1000.0))
+        })
+        .collect()
+}
+
 /// Route a board. The board is not changed; the result says what to add.
 /// What a call of route_inner is for.
 enum Stage<'f> {
@@ -3562,8 +3589,10 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
         // (a rule may give a net one width on outer layers and another on inner ones)
         let widths: Vec<f64> = (0..nl)
             .map(|l| {
-                opt.track_width
-                    .unwrap_or_else(|| rules.track_width_on(&net, layer_of(l)))
+                opt.track_width.unwrap_or_else(|| match opt.kept_widths.get(&net) {
+                    Some(w) => w.max(rules.track_floor(&net)),
+                    None => rules.track_width_on(&net, layer_of(l)),
+                })
             })
             .collect();
         let width = widths.iter().cloned().fold(0.0, f64::max);
@@ -4526,6 +4555,54 @@ mod tests {
         }
         s += "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
         Board::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_net_routed_again_keeps_the_width_its_tracks_had() {
+        // P is mostly 1.2 mm wide (10 mm of it), with a short 0.25 mm piece; Q is 0.4 mm
+        let seg = |x0: f64, x1: f64, y: f64, w: f64, net: &str| {
+            format!(
+                "(segment (start {} {}) (end {} {}) (width {}) (layer \"F.Cu\") (net \"{}\"))\n",
+                x0, y, x1, y, w, net
+            )
+        };
+        let mut s = String::from(HEAD);
+        s += &seg(2.0, 12.0, 3.0, 1.2, "P");
+        s += &seg(12.0, 14.0, 3.0, 0.25, "P");
+        s += &seg(2.0, 6.0, 8.0, 0.4, "Q");
+        s += "(gr_rect (start 0 0) (end 20 12) (layer \"Edge.Cuts\")))";
+        let had = Board::parse(s).unwrap();
+        let kept = board_widths(&had, &Options::default());
+        assert_eq!(kept.get("P"), Some(&1.2));
+        assert_eq!(kept.get("Q"), Some(&0.4));
+        // routed from nothing with those widths: P's new tracks are 1.2 mm, not the rules' 0.25
+        let mut s = String::from(HEAD);
+        s += &smd("A", "P", 3.0, 3.0, 2.0, 2.0);
+        s += &smd("B", "P", 17.0, 9.0, 2.0, 2.0);
+        s += "(gr_rect (start 0 0) (end 20 12) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let r = route(
+            &b,
+            &rules(),
+            &Options {
+                kept_widths: kept,
+                ..Options::default()
+            },
+        );
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(r.tracks.iter().all(|t| (t.width - 1.2).abs() < 1e-9), "{:?}", r.tracks);
+        // and none thinner than the rules allow, whatever the board had
+        let thin: BTreeMap<String, f64> = [("P".to_string(), 0.05)].into_iter().collect();
+        let r = route(
+            &b,
+            &rules(),
+            &Options {
+                kept_widths: thin,
+                ..Options::default()
+            },
+        );
+        let floor = rules().track_floor("P");
+        assert!(r.tracks.iter().all(|t| t.width >= floor - 1e-9), "{:?}", r.tracks);
     }
 
     #[test]

@@ -16,6 +16,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **KiCad's rules, per net pair.** Clearance between two items is worked out the way KiCad's DRC does it: the larger net-class clearance, overridden by the last custom rule that matches, never below the board minimum.
 - **Existing copper is kept.** Pads, tracks and vias of other nets are obstacles. A net's own copper already joins what it reaches, counted the way KiCad counts it (a track's end, or a via's or pad's centre, on the other item), so only the missing links are routed. Locked items stay even with `--rip`.
 - **Tracks finish on the pad's centre.** The last piece of track into a pad is checked against every clearance exactly, not on the grid, and a pad too small for a grid point is entered from just beside it.
+- **A net routed again keeps its width.** With `--keep-widths`, each net is routed at the width its tracks on the board mostly had, so taking up a hand-routed board and routing it again keeps the wide power tracks without writing a rule for each.
 - **Wide tracks narrow to reach small pads.** Where a power track is too wide to get between a pad's neighbours, it stops where it still fits and a short, straight, narrower piece finishes the job, as wide as the gap allows (`--neck` sets the narrowest it may go, `--neck-length` how long). Every such pad is listed in the summary.
 - **Kept fan-outs are used.** Where a net already has a track with a loose end (a locked fan-out, a half-drawn track), the new track ends on that end and nothing is left dangling.
 - **Vias stay off pads.** No via is put on a surface-mount pad of its own net (the open hole drains the solder joint) unless you pass `--via-in-pad`, and none in a through-hole pad or on another via.
@@ -53,6 +54,9 @@ autorouter BOARD.kicad_pcb [options]
       --skip A,B         never route these nets
       --include-poured   also route nets that have a copper pour (left to the pour by default)
       --rip              remove the existing tracks and vias of the nets being routed first
+      --keep-widths      route each net at the width its tracks on the board mostly have
+                         (by length), not the rules' width; with --rip, the width of the
+                         tracks taken up. Nets with no tracks yet follow the rules
       --layers F.Cu,B.Cu copper layers to use (default: all)
       --grid MM          grid pitch (default 0.25; 0.254 suits 0.1 inch through-hole parts)
       --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
@@ -151,7 +155,7 @@ Five real boards, each with its tracks ripped up and routed again from nothing, 
 
 The one unconnected item is a pour, not a track: on the battery board the new tracks cut one pad off its pour. The router's own pour check said so before KiCad did. Nets left to a pour are the open problem here (see Limits).
 
-On the dispenser board with real widths, three pads of the 1.2 mm supply are reached by a narrowed piece, 1.0 to 1.05 mm wide, and 14 of the 19 vias on wide tracks got a second via; the other five had no room and are listed.
+On the dispenser board with real widths, three pads of the 1.2 mm supply are reached by a narrowed piece, 1.0 to 1.05 mm wide, and 14 of the 19 vias on wide tracks got a second via; the other five had no room and are listed. The same board routed with `--keep-widths` instead of those rules, its widths taken from the tracks it had, comes out much the same: 100 of 100 nets, 164 vias, 0 DRC errors, the same three pads narrowed.
 
 Blind and buried vias were tried on the vehicle tracker, with tracks allowed on its two inner layers. With every span allowed, 194 of its 245 vias came out blind; with only neighbouring layers joined (`F.Cu-In1.Cu,In1.Cu-In2.Cu,In2.Cu-B.Cu`), 123 blind and 1 buried of 242. Both runs join all 187 nets and pass KiCad's DRC with no errors, no warnings and nothing unconnected.
 
