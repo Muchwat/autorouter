@@ -146,11 +146,11 @@ Five real boards, each with its tracks ripped up and routed again from nothing, 
 
 | Board | Nets | Joined | Vias | Track | Time | DRC errors | Unconnected | Same on repeat |
 |---|---|---|---|---|---|---|---|---|
-| Reflow-hotplate controller, 110 x 88 mm, 2 layers, 240 V mains (hand-routed mains kept) | 27 | 27 | 8 | 1198 mm | 1.1 s | 0 | 0 | yes |
-| Dispenser controller, 176 x 69 mm, 2 layers, 164 parts, ESP32-S3 and USB-C | 100 | 100 | 141 | 3563 mm | 8.3 s | 0 | 0 | yes |
-| The same, with 0.5 to 1.6 mm power and mains widths as rules | 100 | 100 | 161 | 3663 mm | 14.7 s | 0 | 0 | yes |
-| Battery-management board, 2 layers, four pours | 42 | 42 | 37 | 779 mm | 1.0 s | 0 | 1 | yes |
-| Vehicle tracker, 4 layers with two inner planes, 187 nets | 187 | 187 | 274 | 5286 mm | 49.1 s | 0 | 0 | yes |
+| Reflow-hotplate controller, 110 x 88 mm, 2 layers, 240 V mains (hand-routed mains kept) | 27 | 27 | 8 | 1196 mm | 0.9 s | 0 | 0 | yes |
+| Dispenser controller, 176 x 69 mm, 2 layers, 164 parts, ESP32-S3 and USB-C | 100 | 100 | 136 | 3548 mm | 8.2 s | 0 | 0 | yes |
+| The same, with 0.5 to 1.6 mm power and mains widths as rules | 100 | 100 | 161 | 3634 mm | 18.2 s | 0 | 0 | yes |
+| Battery-management board, 2 layers, four pours | 42 | 42 | 37 | 775 mm | 1.1 s | 0 | 1 | yes |
+| Vehicle tracker, 4 layers with two inner planes, 187 nets | 187 | 187 | 282 | 5229 mm | 65.5 s | 0 | 0 | yes |
 | **All five** | **456** | **456** | | | | **0** | **1** | |
 
 The one unconnected item is a pour, not a track: on the battery board the new tracks cut one pad off its pour. The router's own pour check said so before KiCad did. Nets left to a pour are the open problem here (see Limits).

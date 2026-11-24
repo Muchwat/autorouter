@@ -3104,6 +3104,8 @@ impl<'a> Router<'a> {
             .map(|z| (z.layers.clone(), z.outline.clone()))
             .collect();
 
+        // the clearance owed to each other net, by layer and kind, asked of the rules once
+        let mut owe: HashMap<(&str, usize, bool), f64> = HashMap::new();
         let mut tracks: Vec<(usize, Vec<P>, f64)> = Vec::new();
         let (mut corners, mut saved) = (0usize, 0.0f64);
         for (l, pts, w) in &laid.tracks {
@@ -3162,11 +3164,18 @@ impl<'a> Router<'a> {
                     if *sl != l {
                         continue;
                     }
-                    let need = self
-                        .rules
-                        .clearance(&Item::track(&net).on(on), &Item::track(other).on(on))
-                        + hw
-                        + shw;
+                    let key = (other.as_str(), if layered { l } else { 0 }, false);
+                    let c = match owe.get(&key) {
+                        Some(c) => *c,
+                        None => {
+                            let c = self
+                                .rules
+                                .clearance(&Item::track(&net).on(on), &Item::track(other).on(on));
+                            owe.insert(key, c);
+                            c
+                        }
+                    };
+                    let need = c + hw + shw;
                     if a.0.min(b.0) - bb.2 > need
                         || bb.0 - a.0.max(b.0) > need
                         || a.1.min(b.1) - bb.3 > need
@@ -3180,12 +3189,18 @@ impl<'a> Router<'a> {
                     if l < *sa || l > *sb {
                         continue;
                     }
-                    let need = (self
-                        .rules
-                        .clearance(&Item::track(&net).on(on), &Item::via(other).on(on))
-                        + d / 2.0)
-                        .max(self.rules.hole_clearance + h / 2.0)
-                        + hw;
+                    let key = (other.as_str(), if layered { l } else { 0 }, true);
+                    let c = match owe.get(&key) {
+                        Some(c) => *c,
+                        None => {
+                            let c = self
+                                .rules
+                                .clearance(&Item::track(&net).on(on), &Item::via(other).on(on));
+                            owe.insert(key, c);
+                            c
+                        }
+                    };
+                    let need = (c + d / 2.0).max(self.rules.hole_clearance + h / 2.0) + hw;
                     if at.0 - bb.2 > need || bb.0 - at.0 > need || at.1 - bb.3 > need || bb.1 - at.1 > need {
                         continue;
                     }
