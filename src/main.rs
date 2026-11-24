@@ -38,7 +38,7 @@ usage: autorouter BOARD.kicad_pcb [options]
       --no-fanout        do not bring out pads the grid cannot reach (the inner balls of
                          a BGA, tight fine-pitch pads) with an escape track or a via
       --fanout-length MM how far from its pad a fan-out may end (default 2)
-      --neck MM          width a track narrows to where it is too wide to reach a pad
+      --neck MM          narrowest a track may go where it is too wide to reach a pad
                          (default: the Default class's width, or the rules' minimum if more)
       --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
       --no-diff-pairs    route nets named as pairs (D+/D-, _P/_N) one by one, not as pairs

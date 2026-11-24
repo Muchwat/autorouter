@@ -16,7 +16,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **KiCad's rules, per net pair.** Clearance between two items is worked out the way KiCad's DRC does it: the larger net-class clearance, overridden by the last custom rule that matches, never below the board minimum.
 - **Existing copper is kept.** Pads, tracks and vias of other nets are obstacles. A net's own copper already joins what it reaches, counted the way KiCad counts it (a track's end, or a via's or pad's centre, on the other item), so only the missing links are routed. Locked items stay even with `--rip`.
 - **Tracks finish on the pad's centre.** The last piece of track into a pad is checked against every clearance exactly, not on the grid, and a pad too small for a grid point is entered from just beside it.
-- **Wide tracks narrow to reach small pads.** Where a power track is too wide to get between a pad's neighbours, it stops where it still fits and a short, straight, narrower piece finishes the job (`--neck`, `--neck-length`). Every such pad is listed in the summary.
+- **Wide tracks narrow to reach small pads.** Where a power track is too wide to get between a pad's neighbours, it stops where it still fits and a short, straight, narrower piece finishes the job, as wide as the gap allows (`--neck` sets the narrowest it may go, `--neck-length` how long). Every such pad is listed in the summary.
 - **Kept fan-outs are used.** Where a net already has a track with a loose end (a locked fan-out, a half-drawn track), the new track ends on that end and nothing is left dangling.
 - **Vias stay off pads.** No via is put on a surface-mount pad of its own net (the open hole drains the solder joint) unless you pass `--via-in-pad`, and none in a through-hole pad or on another via.
 - **Wide tracks get two vias.** A track of 0.8 mm or more gets a second via beside each via, joined on both layers, so one small hole is not the weak point of a power path (`--double-vias`). Where there is no room, the via is listed.
@@ -73,7 +73,7 @@ autorouter BOARD.kicad_pcb [options]
       --no-fanout        do not bring out pads the grid cannot reach (the inner balls of
                          a BGA, tight fine-pitch pads) with an escape track or a via
       --fanout-length MM how far from its pad a fan-out may end (default 2)
-      --neck MM          width a track narrows to where it is too wide to reach a pad
+      --neck MM          narrowest a track may go where it is too wide to reach a pad
                          (default: the Default class's width, or the rules' minimum if more)
       --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
       --no-diff-pairs    route nets named as pairs one by one, not as pairs
@@ -149,7 +149,7 @@ Five real boards, each with its tracks ripped up and routed again from nothing, 
 
 The one unconnected item is a pour, not a track: on the battery board the new tracks cut one pad off its pour. The router's own pour check said so before KiCad did. Nets left to a pour are the open problem here (see Limits).
 
-On the dispenser board with real widths, three pads of the 1.2 mm supply are reached by a narrowed piece, and 14 of the 19 vias on wide tracks got a second via; the other five had no room and are listed.
+On the dispenser board with real widths, three pads of the 1.2 mm supply are reached by a narrowed piece, 1.0 to 1.05 mm wide, and 14 of the 19 vias on wide tracks got a second via; the other five had no room and are listed.
 
 Blind and buried vias were tried on the vehicle tracker, with tracks allowed on its two inner layers. With every span allowed, 194 of its 245 vias came out blind; with only neighbouring layers joined (`F.Cu-In1.Cu,In1.Cu-In2.Cu,In2.Cu-B.Cu`), 123 blind and 1 buried of 242. Both runs join all 187 nets and pass KiCad's DRC with no errors, no warnings and nothing unconnected.
 

@@ -50,8 +50,9 @@ pub struct Options {
     /// Let a via sit on a surface-mount pad of its own net (kept off by default:
     /// an open hole in a pad drains the solder joint).
     pub via_in_pad: bool,
-    /// Where a track is too wide to reach a pad, finish with a straight piece
-    /// this wide (None: the Default class's width), no thinner than the rules allow.
+    /// Where a track is too wide to reach a pad, finish with a straight piece as
+    /// wide as fits and no narrower than this (None: the Default class's width), no
+    /// thinner than the rules allow.
     pub neck: Option<f64>,
     /// The longest such narrow piece, in mm (0: never narrow).
     pub neck_length: f64,
@@ -657,6 +658,19 @@ fn recent_via(wk: &Work, s: &Search, mut st: usize, span: Span) -> bool {
 
 /// The cheapest path from any source to any target: its states, and for each
 /// the via span it was reached by (NO_VIA for a step along a layer).
+/// The widths a narrowed piece may take, narrowest first: the neck width, then
+/// every 0.05 mm step above it, short of the full width.
+fn neck_ladder(neck: f64, full: f64) -> Vec<f64> {
+    const STEP: f64 = 0.05;
+    let mut out = vec![neck];
+    let mut k = (neck / STEP + 1e-6).floor() as i64 + 1;
+    while (k as f64) * STEP < full - 1e-9 {
+        out.push(((k as f64) * STEP * 1000.0).round() / 1000.0);
+        k += 1;
+    }
+    out
+}
+
 fn astar(
     gr: &Grid,
     wk: &mut Work,
@@ -1329,7 +1343,8 @@ impl<'a> Router<'a> {
                         continue;
                     }
                     // too wide to get there, or only into a pocket: the nearest cells with
-                    // room around them that a narrower piece reaches from
+                    // room around them that a narrower piece reaches from, the piece as
+                    // wide as will go (the neck width is only the floor)
                     if let Some(nw) = neck.filter(|nw| *nw < widths[l] - 1e-9) {
                         let mut cells: Vec<(f64, usize)> = Vec::new();
                         let bl = &block[l];
@@ -1342,14 +1357,36 @@ impl<'a> Router<'a> {
                             e.0 = geom::dist(self.gr.xy(e.1), centre);
                         }
                         cells.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+                        let fits = |w: f64| {
+                            cells
+                                .iter()
+                                .any(|&(_, c)| self.stub_ok(w / 2.0, self.gr.xy(c), centre, l, &near, edge))
+                        };
+                        let w = if fits(nw) {
+                            // a narrower piece fits wherever a wider one does, so the widest
+                            // that fits is found by halving the ladder
+                            let ladder = neck_ladder(nw, widths[l]);
+                            let (mut lo, mut hi) = (0, ladder.len());
+                            while hi - lo > 1 {
+                                let mid = (lo + hi) / 2;
+                                if fits(ladder[mid]) {
+                                    lo = mid;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                            ladder[lo]
+                        } else {
+                            nw
+                        };
                         let mut nearest: Option<f64> = None;
                         for (d, c) in cells {
                             if nearest.map(|m| d > m + 2.0 * g).unwrap_or(false) {
                                 break;
                             }
-                            if self.stub_ok(nw / 2.0, self.gr.xy(c), centre, l, &near, edge) {
+                            if self.stub_ok(w / 2.0, self.gr.xy(c), centre, l, &near, edge) {
                                 nearest.get_or_insert(d);
-                                st.push(((l * n + c) as u32, Some((centre, nw))));
+                                st.push(((l * n + c) as u32, Some((centre, w))));
                             }
                         }
                     }
@@ -4359,6 +4396,14 @@ mod tests {
     }
 
     #[test]
+    fn the_neck_ladder_runs_from_the_floor_in_steps_short_of_full_width() {
+        assert_eq!(neck_ladder(0.25, 0.5), vec![0.25, 0.3, 0.35, 0.4, 0.45]);
+        assert_eq!(neck_ladder(0.2, 0.25), vec![0.2]);
+        assert_eq!(neck_ladder(0.22, 0.4), vec![0.22, 0.25, 0.3, 0.35]);
+        assert_eq!(neck_ladder(0.25, 1.2).len(), 19);
+    }
+
+    #[test]
     fn wide_tracks_get_a_second_via() {
         // one wide net that has to change layer under a wall of another net's track
         let s = String::from(HEAD)
@@ -4416,7 +4461,8 @@ mod tests {
     #[test]
     fn a_wide_track_narrows_to_reach_a_small_pad() {
         // a 1.2 mm track cannot get between the neighbours of the middle pin; a short
-        // 0.25 mm piece can
+        // narrower piece can, as wide as the gap allows (0.65 mm pitch, 0.35 mm pads and
+        // 0.2 mm clearance leave room for 0.55 mm), not the 0.25 mm floor
         let mut s = String::from(HEAD);
         for (k, net) in ["X", "P", "Y"].iter().enumerate() {
             s += &smd(&format!("U{}", k), net, 10.0 + 0.65 * k as f64, 5.0, 0.35, 1.4);
@@ -4431,7 +4477,9 @@ mod tests {
         let r = route(&b, &rules(), &wide);
         assert!(r.complete(), "{:?}", r.nets);
         assert_eq!(r.nets[0].necked.len(), 1, "{:?}", r.nets[0].necked);
-        assert!(r.tracks.iter().any(|t| (t.width - 0.25).abs() < 1e-9));
+        let neck = r.nets[0].necked[0].1;
+        assert!(neck > 0.45 - 1e-9 && neck < 0.55 + 1e-9, "narrowed to {} mm", neck);
+        assert!(r.tracks.iter().any(|t| (t.width - neck).abs() < 1e-9));
         assert!(r.tracks.iter().any(|t| (t.width - 1.2).abs() < 1e-9));
         assert!(
             smallest_gap(&b, &r) >= 0.2 - 1e-6,
