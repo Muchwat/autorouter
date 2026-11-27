@@ -120,18 +120,22 @@ fn copper(board: &Board, routed: Option<&Routed>) -> Vec<Copper> {
 /// For one poured net: which piece each of its pads is on (None: on no copper
 /// the grid can see), and the size of each piece.
 fn pieces(board: &Board, rules: &Rules, net: &str, items: &[Copper], gr: &Grid) -> (Vec<Option<u32>>, Vec<u32>) {
-    let (of_pad, sizes, _) = labelled(board, rules, net, items, gr);
+    let (of_pad, sizes, _) = labelled(board, rules, net, items, gr, true);
     (of_pad, sizes)
 }
 
 /// As `pieces`, and third: the piece each grid point is on, layer by layer
-/// (u32::MAX: none of the net's copper there).
+/// (u32::MAX: none of the net's copper there). `pad_barrels`: a drilled pad
+/// joins the layers it reaches, as a via does; without, only vias do, and the
+/// copper round a drilled pad on each layer has to reach the rest by itself
+/// (KiCad wants a pad's thermal spokes on copper that goes somewhere).
 fn labelled(
     board: &Board,
     rules: &Rules,
     net: &str,
     items: &[Copper],
     gr: &Grid,
+    pad_barrels: bool,
 ) -> (Vec<Option<u32>>, Vec<u32>, Vec<u32>) {
     let nl = board.copper.len();
     let n = gr.w * gr.h;
@@ -199,7 +203,8 @@ fn labelled(
     // the net's own copper conducts wherever it is; through pads and vias join
     // the layers they reach. up[l * n + c]: layer l is joined to the next one down at c
     let mut up = vec![false; n * nl];
-    for (onet, shape, layers) in items {
+    // (`copper` lists the board's pads first)
+    for (at, (onet, shape, layers)) in items.iter().enumerate() {
         if onet.as_deref() != Some(net) {
             continue;
         }
@@ -207,6 +212,9 @@ fn labelled(
             let layer = &mut on[l * n..(l + 1) * n];
             gr.each(shape, 0.0, |c| layer[c] = 1);
             layer[gr.cell(shape.centre())] = 1;
+        }
+        if !pad_barrels && at < board.pads.len() {
+            continue;
         }
         if let (Some(&a), Some(&b)) = (layers.iter().min(), layers.iter().max()) {
             let c = gr.cell(shape.centre());
@@ -283,7 +291,7 @@ pub fn on_plane(board: &Board, rules: &Rules, net: &str, planes: &[usize], grid:
         Some(g) => g,
         None => return vec![false; pads],
     };
-    let (of_pad, sizes, label) = labelled(board, rules, net, &copper(board, None), &gr);
+    let (of_pad, sizes, label) = labelled(board, rules, net, &copper(board, None), &gr, true);
     // the plane: the piece with the most copper on those layers
     let n = gr.w * gr.h;
     let mut there = vec![0u32; sizes.len()];
@@ -417,6 +425,10 @@ fn inside(board: &Board, gr: &Grid) -> Vec<bool> {
 /// does, a via of the net is put where the two lie one over the other. The vias
 /// are added to `routed`.
 ///
+/// A drilled pad does not count as joining its layers here: the pour round it
+/// on each layer has to reach the rest of the net by pour or by a via, or
+/// KiCad finds its thermal spokes on an island.
+///
 /// A piece is joined if it has a pad of the net on it, or if the zone keeps
 /// pieces without pads when it is filled and the piece is a square millimetre
 /// or more. Only what was whole before routing is mended; a piece that was
@@ -448,7 +460,7 @@ pub fn stitch(board: &Board, rules: &Rules, routed: &mut Routed, grid: f64, via_
             .zones
             .iter()
             .any(|z| z.keepout.is_none() && z.net.as_deref() == Some(net.as_str()) && z.keeps_islands);
-        let (was_pad, was_sizes, was) = labelled(board, rules, &net, &before, &gr);
+        let (_, was_sizes, was) = labelled(board, rules, &net, &before, &gr, false);
         let main_was = match biggest(&was_sizes) {
             Some(m) => m,
             None => continue,
@@ -457,7 +469,7 @@ pub fn stitch(board: &Board, rules: &Rules, routed: &mut Routed, grid: f64, via_
         // (a board is not stitched without end: each round adds one via)
         for _ in 0..64 {
             let after = copper(board, Some(routed));
-            let (now_pad, now_sizes, now) = labelled(board, rules, &net, &after, &gr);
+            let (_, now_sizes, now) = labelled(board, rules, &net, &after, &gr, false);
             let main_now = match biggest(&now_sizes) {
                 Some(m) => m,
                 None => break,
@@ -548,8 +560,16 @@ pub fn stitch(board: &Board, rules: &Rules, routed: &mut Routed, grid: f64, via_
                 if piece == main_now || !cut[piece as usize] {
                     continue;
                 }
+                // its pads that were on the main piece and are on this one now (a drilled
+                // pad layer by layer: its copper on each has to reach the rest)
                 let lost: Vec<usize> = (0..pads.len())
-                    .filter(|&k| now_pad[k] == Some(piece) && was_pad[k] == Some(main_was))
+                    .filter(|&k| {
+                        let c = gr.cell(pads[k].shape.centre());
+                        pads[k]
+                            .layers
+                            .iter()
+                            .any(|&l| now[l * n + c] == piece && was[l * n + c] == main_was)
+                    })
                     .collect();
                 let area = now_sizes[piece as usize] as f64 * gr.g * gr.g;
                 if lost.is_empty() && !(keeps && area >= 1.0) {
@@ -705,5 +725,62 @@ mod tests {
         assert!(stitch(&b, &rules, &mut r, 0.25, false).is_empty());
         assert!(r.vias.is_empty());
         assert_eq!(cuts(&b, &rules, &r, 0.25, None).len(), 1);
+    }
+    #[test]
+    fn the_pour_round_a_drilled_pad_is_joined_again() {
+        // GND on both layers, joined by a via; a drilled GND pad in the middle. New
+        // tracks on the back box the pad in: its copper there is an island that only
+        // the pad's own barrel joins to the rest, which KiCad does not take for joined
+        let t = r#"(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+          (footprint "P" (at 15 5) (property "Reference" "J") (pad "1" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 0.8) (layers "*.Cu") (net "GND")))
+          (footprint "P" (at 3 5) (property "Reference" "A") (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "GND")))
+          (via (at 3 8) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net "GND"))
+          (zone (net "GND") (layer "F.Cu") (connect_pads (clearance 0.3)) (min_thickness 0.25)
+            (polygon (pts (xy 0.5 0.5) (xy 29.5 0.5) (xy 29.5 9.5) (xy 0.5 9.5))))
+          (zone (net "GND") (layer "B.Cu") (connect_pads (clearance 0.3)) (min_thickness 0.25)
+            (polygon (pts (xy 0.5 0.5) (xy 29.5 0.5) (xy 29.5 9.5) (xy 0.5 9.5))))
+          (gr_rect (start 0 0) (end 30 10) (layer "Edge.Cuts")))"#;
+        let b = Board::parse(t.to_string()).unwrap();
+        let rules = Rules::default();
+        let mut r = Routed::default();
+        let corners = [(12.5, 2.5), (17.5, 2.5), (17.5, 7.5), (12.5, 7.5)];
+        for k in 0..4 {
+            r.tracks.push(NewTrack {
+                net: "S".into(),
+                layer: 1,
+                a: corners[k],
+                b: corners[(k + 1) % 4],
+                width: 0.25,
+            });
+        }
+        let done = stitch(&b, &rules, &mut r, 0.25, false);
+        assert_eq!(done.len(), 1, "{:?}", done);
+        assert_eq!(done[0].pads, vec!["J.1".to_string()]);
+        // inside the box, clear of the pad's hole and of the tracks
+        let v = &r.vias[0];
+        assert!(
+            v.at.0 > 12.5 && v.at.0 < 17.5 && v.at.1 > 2.5 && v.at.1 < 7.5,
+            "{:?}",
+            v.at
+        );
+        assert!(b.pads[0].shape.dist(v.at) >= rules.hole_to_hole + v.drill / 2.0 - 1e-9);
+        let clr = rules.clearance(&Item::via("GND"), &Item::track("S"));
+        for t in &r.tracks {
+            assert!(geom::seg_dist(v.at, t.a, t.b) >= 0.125 + clr + v.diameter / 2.0 - 1e-9);
+        }
+        assert!(stitch(&b, &rules, &mut r, 0.25, false).is_empty(), "once is enough");
+        // the same box on the front, where the pad has no hold on the back's pour to lose
+        // either: it is boxed in there instead, and mended the same way
+        let mut r = Routed::default();
+        for k in 0..4 {
+            r.tracks.push(NewTrack {
+                net: "S".into(),
+                layer: 0,
+                a: corners[k],
+                b: corners[(k + 1) % 4],
+                width: 0.25,
+            });
+        }
+        assert_eq!(stitch(&b, &rules, &mut r, 0.25, false).len(), 1);
     }
 }

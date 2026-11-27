@@ -2714,110 +2714,162 @@ impl<'a> Router<'a> {
                     second: None,
                     limit,
                 };
-                match astar(&self.gr, &mut self.work, &search, &gates[k], &gates[k + 1], mid) {
-                    None => stopped = Some("no way through wide enough for both tracks".into()),
-                    Some((path, how)) => {
-                        // the layers each change of layer joins, in the path's order
-                        let via_spans: Vec<Span> = (1..path.len())
-                            .filter(|&i| path[i] as usize / n != path[i - 1] as usize / n)
-                            .map(|i| spans[how[i] as usize])
-                            .collect();
-                        // the centreline, per layer, corners only
-                        let mut runs: Vec<pair::Line> = Vec::new();
-                        for &s in &path {
-                            let (l, p) = (s as usize / n, self.gr.xy(s as usize % n));
-                            match runs.last_mut() {
-                                Some((rl, pts)) if *rl == l => {
-                                    if pts.len() >= 2 {
-                                        let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
-                                        if ((b.0 - a.0) * (p.1 - b.1) - (b.1 - a.1) * (p.0 - b.0)).abs() < 1e-9 {
-                                            pts.pop();
-                                        }
-                                    }
-                                    pts.push(p);
-                                }
-                                _ => {
-                                    // the next run starts where this one ends, a layer away
-                                    runs.push((l, vec![p]));
-                                }
-                            }
+                // First any gate to any gate. The positive track must be on the same side
+                // of the way all along, and the search knows nothing of sides: where the
+                // nearest gates disagree, look again between gates that agree (the positive
+                // track out on one side of the way out here, on the other side of the way
+                // out there), and take the shorter of the two.
+                let gr = &self.gr;
+                let by_side = |e: &PairEnd, gs: &[u32]| -> [Vec<u32>; 2] {
+                    let m = ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
+                    let mut out = [Vec::new(), Vec::new()];
+                    for &st in gs {
+                        let (l, at) = (st as usize / n, gr.xy(st as usize % n));
+                        let d = geom::dist(at, m);
+                        if d < 1e-9 {
+                            continue;
                         }
-                        let mut bbox = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-                        for q in runs
-                            .iter()
-                            .flat_map(|r| r.1.iter())
-                            .chain([ea.p, ea.n, eb.p, eb.n].iter())
-                        {
-                            bbox = (bbox.0.min(q.0), bbox.1.min(q.1), bbox.2.max(q.0), bbox.3.max(q.1));
-                        }
-                        let near = self.near(j, bbox, spec.via_pitch + reach);
-                        // the pair faces straight out from its first pads and straight in to its last
-                        let mid_of = |e: &PairEnd| ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
-                        let (g0, g1) = (
-                            self.gr.xy(path[0] as usize % n),
-                            self.gr.xy(path[path.len() - 1] as usize % n),
+                        let side = (-(at.1 - m.1) / d, (at.0 - m.0) / d);
+                        let (q1, q2) = (
+                            (at.0 + halves[l] * side.0, at.1 + halves[l] * side.1),
+                            (at.0 - halves[l] * side.0, at.1 - halves[l] * side.1),
                         );
-                        let toward = |a: P, b: P| {
-                            let d = geom::dist(a, b);
-                            if d > 1e-9 {
-                                Some(((b.0 - a.0) / d, (b.1 - a.1) / d))
-                            } else {
-                                None
-                            }
-                        };
-                        let heading = (toward(mid_of(ea), g0), toward(g1, mid_of(eb)));
-                        // which track runs on which side: try both; and if the path's first
-                        // or last step is too far off the way the pair faces, let the path decide
-                        let mut why = String::new();
-                        let mut leg: Option<pair::Leg> = None;
-                        'tries: for facing in [heading, (None, heading.1), (heading.0, None), (None, None)] {
-                            for first in [1.0, -1.0] {
-                                match pair::leg(
-                                    &runs,
-                                    &halves,
-                                    via_half,
-                                    spec.via_side,
-                                    first,
-                                    (ea.p, ea.n),
-                                    (eb.p, eb.n),
-                                    facing,
-                                )
-                                .and_then(|l| self.pair_legal(j, &spec, &l, &via_spans, &near).map(|_| l))
-                                {
-                                    Ok(l) => {
-                                        leg = Some(l);
-                                        break 'tries;
+                        let plus =
+                            geom::dist(e.p, q1) + geom::dist(e.n, q2) <= geom::dist(e.p, q2) + geom::dist(e.n, q1);
+                        out[if plus { 0 } else { 1 }].push(st);
+                    }
+                    out
+                };
+                let (sa, sb) = (by_side(ea, &gates[k]), by_side(eb, &gates[k + 1]));
+                let mut tries: Vec<(&[u32], &[u32])> = vec![(&gates[k], &gates[k + 1])];
+                let mut found: Vec<(pair::Leg, Vec<u32>, Vec<Span>)> = Vec::new();
+                let mut first_why: Option<String> = None;
+                let mut at = 0;
+                while at < tries.len() {
+                    let (from, to) = tries[at];
+                    at += 1;
+                    let mut why = String::new();
+                    let mut leg: Option<(pair::Leg, Vec<u32>, Vec<Span>)> = None;
+                    match astar(&self.gr, &mut self.work, &search, from, to, mid) {
+                        None => why = "no way through wide enough for both tracks".into(),
+                        Some((path, how)) => {
+                            // the layers each change of layer joins, in the path's order
+                            let via_spans: Vec<Span> = (1..path.len())
+                                .filter(|&i| path[i] as usize / n != path[i - 1] as usize / n)
+                                .map(|i| spans[how[i] as usize])
+                                .collect();
+                            // the centreline, per layer, corners only
+                            let mut runs: Vec<pair::Line> = Vec::new();
+                            for &s in &path {
+                                let (l, p) = (s as usize / n, self.gr.xy(s as usize % n));
+                                match runs.last_mut() {
+                                    Some((rl, pts)) if *rl == l => {
+                                        if pts.len() >= 2 {
+                                            let (a, b) = (pts[pts.len() - 2], pts[pts.len() - 1]);
+                                            if ((b.0 - a.0) * (p.1 - b.1) - (b.1 - a.1) * (p.0 - b.0)).abs() < 1e-9 {
+                                                pts.pop();
+                                            }
+                                        }
+                                        pts.push(p);
                                     }
-                                    // (the last try is the most forgiving: its reason is the real one)
-                                    Err(e) => why = e,
+                                    _ => {
+                                        // the next run starts where this one ends, a layer away
+                                        runs.push((l, vec![p]));
+                                    }
                                 }
                             }
+                            let mut bbox = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                            for q in runs
+                                .iter()
+                                .flat_map(|r| r.1.iter())
+                                .chain([ea.p, ea.n, eb.p, eb.n].iter())
+                            {
+                                bbox = (bbox.0.min(q.0), bbox.1.min(q.1), bbox.2.max(q.0), bbox.3.max(q.1));
+                            }
+                            let near = self.near(j, bbox, spec.via_pitch + reach);
+                            // the pair faces straight out from its first pads and straight in to its last
+                            let mid_of = |e: &PairEnd| ((e.p.0 + e.n.0) / 2.0, (e.p.1 + e.n.1) / 2.0);
+                            let (g0, g1) = (
+                                self.gr.xy(path[0] as usize % n),
+                                self.gr.xy(path[path.len() - 1] as usize % n),
+                            );
+                            let toward = |a: P, b: P| {
+                                let d = geom::dist(a, b);
+                                if d > 1e-9 {
+                                    Some(((b.0 - a.0) / d, (b.1 - a.1) / d))
+                                } else {
+                                    None
+                                }
+                            };
+                            let heading = (toward(mid_of(ea), g0), toward(g1, mid_of(eb)));
+                            // which track runs on which side: try both; and if the path's first
+                            // or last step is too far off the way the pair faces, let the path decide
+                            let mut made: Option<pair::Leg> = None;
+                            'tries: for facing in [heading, (None, heading.1), (heading.0, None), (None, None)] {
+                                for first in [1.0, -1.0] {
+                                    match pair::leg(
+                                        &runs,
+                                        &halves,
+                                        via_half,
+                                        spec.via_side,
+                                        first,
+                                        (ea.p, ea.n),
+                                        (eb.p, eb.n),
+                                        facing,
+                                    )
+                                    .and_then(|l| self.pair_legal(j, &spec, &l, &via_spans, &near).map(|_| l))
+                                    {
+                                        Ok(l) => {
+                                            made = Some(l);
+                                            break 'tries;
+                                        }
+                                        // (the last try is the most forgiving: its reason is the real one)
+                                        Err(e) => why = e,
+                                    }
+                                }
+                            }
+                            if why.contains("too close to each other") {
+                                // both ways round were tried: the two nets do not line up
+                                why = "the two nets are the other way round at one end from the other (the tracks would have to cross), or its pads leave them no room to come together".into();
+                            }
+                            leg = made.map(|l| (l, path, via_spans));
                         }
-                        if why.contains("too close to each other") {
-                            // both ways round were tried: the two nets do not line up
-                            why = "the two nets are the other way round at one end from the other (the tracks would have to cross), or its pads leave them no room to come together".into();
+                    }
+                    match leg {
+                        Some(l) => found.push(l),
+                        None => {
+                            first_why.get_or_insert(why);
                         }
-                        match leg {
-                            None => stopped = Some(why),
-                            Some(l) => {
-                                laid.tracks
-                                    .extend(l.a.iter().map(|(ly, p)| (*ly, p.clone(), spec.ws[*ly])));
-                                laid.tracks_n
-                                    .extend(l.b.iter().map(|(ly, p)| (*ly, p.clone(), spec.ws[*ly])));
-                                let through = (0, nl - 1);
-                                let span = |i: usize| via_spans.get(i).copied().unwrap_or(through);
-                                laid.real_vias
-                                    .extend(l.vias_a.iter().enumerate().map(|(i, &v)| (v, false, span(i))));
-                                laid.real_vias
-                                    .extend(l.vias_b.iter().enumerate().map(|(i, &v)| (v, true, span(i))));
-                                laid.vias
-                                    .extend(l.centres.iter().enumerate().map(|(i, &c)| (c, span(i))));
-                                laid.coupled += l.coupled;
-                                laid.leg = Some(l.clone());
-                                laid.paths.push(path);
-                                done = true;
+                    }
+                    if at == 1 && found.is_empty() {
+                        for (x, y) in [(0, 1), (1, 0)] {
+                            if !sa[x].is_empty() && !sb[y].is_empty() {
+                                tries.push((&sa[x], &sb[y]));
                             }
                         }
+                    }
+                }
+                // (the shorter way, by its steps; the first of two as long)
+                let best = (0..found.len()).min_by_key(|&i| (found[i].1.len(), i));
+                match best.map(|i| found.swap_remove(i)) {
+                    None => stopped = Some(first_why.unwrap_or_default()),
+                    Some((l, path, via_spans)) => {
+                        laid.tracks
+                            .extend(l.a.iter().map(|(ly, p)| (*ly, p.clone(), spec.ws[*ly])));
+                        laid.tracks_n
+                            .extend(l.b.iter().map(|(ly, p)| (*ly, p.clone(), spec.ws[*ly])));
+                        let through = (0, nl - 1);
+                        let span = |i: usize| via_spans.get(i).copied().unwrap_or(through);
+                        laid.real_vias
+                            .extend(l.vias_a.iter().enumerate().map(|(i, &v)| (v, false, span(i))));
+                        laid.real_vias
+                            .extend(l.vias_b.iter().enumerate().map(|(i, &v)| (v, true, span(i))));
+                        laid.vias
+                            .extend(l.centres.iter().enumerate().map(|(i, &c)| (c, span(i))));
+                        laid.coupled += l.coupled;
+                        laid.leg = Some(l.clone());
+                        laid.paths.push(path);
+                        done = true;
                     }
                 }
             }
@@ -4349,11 +4401,26 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
             if !r.active[j] {
                 continue;
             }
+            // (a pair that has its way, to go back to if no other is found)
+            let had = match (&r.jobs[j].pair, &r.laid[j]) {
+                (Some(_), Some(l)) if l.unrouted.is_empty() => Some(l.clone()),
+                _ => None,
+            };
             r.rip(j);
             r.route_job(j, pres, opt.via_cost, opt.limit, false);
             if !r.laid[j].as_ref().unwrap().unrouted.is_empty() {
                 r.rip(j);
                 r.route_job(j, pres, opt.via_cost / 2.0, opt.limit * 5, false);
+            }
+            if let (Some(old), false) = (had, r.laid[j].as_ref().unwrap().unrouted.is_empty()) {
+                // routed again among the others' copper as it lies now, the pair found no
+                // way side by side: it keeps the way it had, and the others, who pay
+                // more for the spot each pass, are the ones to move. (If they cannot, it
+                // is settled further down, with the others as walls.)
+                r.rip(j);
+                r.laid[j] = Some(old);
+                r.contrib[j].clear();
+                r.add(j, 1);
             }
             // a pair that cannot be had even with nothing else in its way: the two nets
             // are routed one by one, further on in this pass
@@ -5419,6 +5486,37 @@ mod tests {
             + extra
             + "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
         Board::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_pair_goes_round_to_come_in_the_right_way_round() {
+        // the far end has the two nets the other way up: straight in, the tracks would
+        // have to cross; round the back of the pads they come in as they should
+        let s = String::from(HEAD)
+            + &smd("J1", "D+", 3.0, 9.6, 0.5, 0.5)
+            + &smd("J2", "D-", 3.0, 10.4, 0.5, 0.5)
+            + &smd("U1", "D+", 24.0, 10.4, 0.5, 0.5)
+            + &smd("U2", "D-", 24.0, 9.6, 0.5, 0.5)
+            + "(gr_rect (start 0 0) (end 36 20) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        let r = route(&b, &rules(), &Options::default());
+        assert!(r.complete(), "{:?}", r.nets);
+        let p = &r.pairs[0];
+        assert!(p.as_pair, "{}", p.note);
+        assert_eq!((p.legs, p.coupled_legs), (1, 1), "{}", p.note);
+        assert!(p.coupled > 20.0, "only {:.1} mm side by side", p.coupled);
+        assert!(r.vias.is_empty(), "no need to change layer: {:?}", r.vias);
+        for net in ["D+", "D-"] {
+            assert!(kicad_joined(&b, &r, net), "{} is not joined", net);
+        }
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        // the tracks went past the far pads and came back to them
+        let east = r.tracks.iter().map(|t| t.a.0.max(t.b.0)).fold(0.0, f64::max);
+        assert!(east > 24.5, "furthest east {:.2}", east);
     }
 
     #[test]
