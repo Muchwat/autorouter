@@ -47,6 +47,17 @@ pub struct Via {
     pub span: (usize, usize),
 }
 
+/// Copper that is drawn, not routed: text and graphics on a copper layer. It
+/// has no net of its own (a footprint's graphic that touches one of its pads is
+/// that pad's copper), and tracks keep their clearance from it like any copper.
+#[derive(Clone, Debug)]
+pub struct Art {
+    pub net: Option<String>,
+    pub shape: Shape,
+    pub layers: Vec<usize>,
+    pub text: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Keepout {
     pub tracks: bool,
@@ -90,6 +101,8 @@ pub struct Board {
     pub zones: Vec<Zone>,
     /// Non-plated holes and slots, as the shape of what is drilled or milled away.
     pub holes: Vec<Shape>,
+    /// Text and graphics drawn on copper layers.
+    pub art: Vec<Art>,
     /// Byte ranges of the zones' stored fills (`filled_polygon`), which go
     /// stale the moment a track is added.
     pub fills: Vec<(usize, usize)>,
@@ -207,6 +220,7 @@ impl Board {
             vias: Vec::new(),
             zones: Vec::new(),
             holes: Vec::new(),
+            art: Vec::new(),
             fills: Vec::new(),
             edges: Vec::new(),
             courtyards: BTreeMap::new(),
@@ -279,6 +293,12 @@ impl Board {
                 Some(h) if h.starts_with("gr_") && item.child_text("layer") == Some("Edge.Cuts") => {
                     b.edge_item(item, (0.0, 0.0), 0.0);
                 }
+                Some(h) if h.starts_with("gr_") => {
+                    let layers = layer_list(item);
+                    if !layers.is_empty() {
+                        b.art_item(item, (0.0, 0.0), 0.0, layers);
+                    }
+                }
                 _ => {}
             }
         }
@@ -308,6 +328,7 @@ impl Board {
             .to_string();
         let place = |p: P| geom::add(origin, rot(p, fdeg));
         let mut court: Option<(f64, f64, f64, f64)> = None;
+        let (first_pad, first_art) = (self.pads.len(), self.art.len());
         for item in fp.items() {
             match item.head() {
                 Some("pad") => self.pad(
@@ -322,6 +343,10 @@ impl Board {
                     let layer = item.child_text("layer").unwrap_or("");
                     if layer == "Edge.Cuts" {
                         self.edge_item(item, origin, fdeg);
+                    }
+                    let on_copper = layer_list(item);
+                    if !on_copper.is_empty() {
+                        self.art_item(item, origin, fdeg, on_copper);
                     }
                     if layer == "F.CrtYd" || layer == "B.CrtYd" {
                         for key in ["start", "end", "center", "mid"] {
@@ -351,6 +376,211 @@ impl Board {
             if !reference.is_empty() {
                 self.courtyards.insert(reference, c);
             }
+        }
+        // a footprint's copper graphic that touches one of its pads is that pad's
+        // copper (an antenna, a net tie, a pad drawn larger): it takes the pad's net
+        for k in first_art..self.art.len() {
+            if self.art[k].text {
+                continue;
+            }
+            let net = self.pads[first_pad..]
+                .iter()
+                .find(|p| {
+                    p.layers.iter().any(|l| self.art[k].layers.contains(l)) && p.shape.touches(&self.art[k].shape)
+                })
+                .and_then(|p| p.net.clone());
+            self.art[k].net = net;
+        }
+    }
+
+    /// Text or a graphic on copper layers, as shapes tracks must keep clear of.
+    /// Text is taken as the box it fills, a little on the generous side (the
+    /// strokes themselves are not worked out); a filled polygon as the box
+    /// round it.
+    fn art_item(&mut self, item: &Node, origin: P, deg: f64, layers: Vec<usize>) {
+        let place = |p: P| geom::add(origin, rot(p, deg));
+        let get = |k: &str| item.get(k).and_then(xy).map(&place);
+        let head = item.head().unwrap_or("");
+        let kind = head.trim_start_matches("gr_").trim_start_matches("fp_");
+        let half = item
+            .get("stroke")
+            .and_then(|s| s.child_num("width"))
+            .or_else(|| item.child_num("width"))
+            .unwrap_or(0.15)
+            .max(0.0)
+            / 2.0;
+        let filled = matches!(item.child_text("fill"), Some("yes") | Some("solid"));
+        let mut out: Vec<(Shape, bool)> = Vec::new();
+        let chain = |pts: &[P], out: &mut Vec<(Shape, bool)>| {
+            for w in pts.windows(2) {
+                out.push((
+                    Shape::Capsule {
+                        a: w[0],
+                        b: w[1],
+                        r: half,
+                    },
+                    false,
+                ));
+            }
+        };
+        match kind {
+            "line" => {
+                if let (Some(a), Some(b)) = (get("start"), get("end")) {
+                    chain(&[a, b], &mut out);
+                }
+            }
+            "arc" => {
+                if let (Some(s), Some(m), Some(e)) = (get("start"), get("mid"), get("end")) {
+                    chain(&geom::arc_points(s, m, e, 0.1), &mut out);
+                }
+            }
+            "circle" => {
+                if let (Some(c), Some(e)) = (get("center"), get("end")) {
+                    let r = geom::dist(c, e);
+                    if filled {
+                        out.push((Shape::Circle { c, r: r + half }, false));
+                    } else {
+                        let n = ((std::f64::consts::TAU * r / 0.1).ceil() as usize).max(12);
+                        let pts: Vec<P> = (0..=n)
+                            .map(|k| {
+                                let a = std::f64::consts::TAU * k as f64 / n as f64;
+                                (c.0 + r * a.cos(), c.1 + r * a.sin())
+                            })
+                            .collect();
+                        chain(&pts, &mut out);
+                    }
+                }
+            }
+            "rect" | "text_box" => {
+                if let (Some(a), Some(b)) = (item.get("start").and_then(xy), item.get("end").and_then(xy)) {
+                    if filled || kind == "text_box" {
+                        let c = place(((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
+                        out.push((
+                            Shape::Box {
+                                c,
+                                hw: (b.0 - a.0).abs() / 2.0 + half,
+                                hh: (b.1 - a.1).abs() / 2.0 + half,
+                                deg,
+                                r: 0.0,
+                            },
+                            kind == "text_box",
+                        ));
+                    } else {
+                        let c = [a, (b.0, a.1), b, (a.0, b.1), a].map(&place);
+                        chain(&c, &mut out);
+                    }
+                }
+            }
+            "poly" | "curve" => {
+                if let Some(pts) = item.get("pts") {
+                    let mut p: Vec<P> = pts.all("xy").filter_map(xy).map(&place).collect();
+                    if kind == "curve" && p.len() == 4 {
+                        p = geom::bezier_points(p[0], p[1], p[2], p[3], 0.1);
+                    } else if kind == "poly" && p.len() >= 3 {
+                        if filled {
+                            let (mut x0, mut y0, mut x1, mut y1) =
+                                (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                            for q in &p {
+                                x0 = x0.min(q.0);
+                                y0 = y0.min(q.1);
+                                x1 = x1.max(q.0);
+                                y1 = y1.max(q.1);
+                            }
+                            out.push((
+                                Shape::Box {
+                                    c: ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+                                    hw: (x1 - x0) / 2.0 + half,
+                                    hh: (y1 - y0) / 2.0 + half,
+                                    deg: 0.0,
+                                    r: 0.0,
+                                },
+                                false,
+                            ));
+                        }
+                        p.push(p[0]);
+                    }
+                    chain(&p, &mut out);
+                }
+            }
+            "text" => {
+                let effects = item.get("effects");
+                if item.flag("hide") || effects.map(|e| e.flag("hide")).unwrap_or(false) {
+                    return;
+                }
+                // (gr_text "words" ...), (fp_text user "words" ...)
+                let words = if head == "fp_text" { item.arg(1) } else { item.arg(0) }.unwrap_or("");
+                let words = words.replace("\\n", "\n");
+                let lines: Vec<&str> = words.trim_end_matches('\n').split('\n').collect();
+                let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                if longest == 0 {
+                    return;
+                }
+                let font = effects.and_then(|e| e.get("font"));
+                let size = font.and_then(|f| f.get("size"));
+                // (size height width)
+                let (h, w) = (
+                    size.and_then(|s| s.num(0)).unwrap_or(1.0),
+                    size.and_then(|s| s.num(1)).unwrap_or(1.0),
+                );
+                let thick = font.and_then(|f| f.child_num("thickness")).unwrap_or(h / 8.0);
+                // KiCad's own box for a line of its stroke font is up to about 1.1 widths
+                // a letter and 1.7 heights; more lines stand 1.62 heights apart
+                let wide = longest as f64 * w * 1.15 + thick;
+                let more = (lines.len() - 1) as f64 * 1.62 * h;
+                let tall = 1.7 * h + thick + more;
+                let just = effects
+                    .and_then(|e| e.get("justify"))
+                    .map(|j| j.args())
+                    .unwrap_or_default();
+                let mirror = if just.contains(&"mirror") { -1.0 } else { 1.0 };
+                let ox = mirror
+                    * if just.contains(&"left") {
+                        wide / 2.0
+                    } else if just.contains(&"right") {
+                        -wide / 2.0
+                    } else {
+                        0.0
+                    };
+                let oy = if just.contains(&"top") {
+                    tall / 2.0
+                } else if just.contains(&"bottom") {
+                    -tall / 2.0
+                } else {
+                    0.0
+                };
+                let at = item.get("at");
+                let angle = at.and_then(|a| a.num(2)).unwrap_or(0.0);
+                let anchor = at.and_then(xy).unwrap_or((0.0, 0.0));
+                let c = place(geom::add(anchor, rot((ox, oy), angle)));
+                // (in a footprint the text's own angle and the footprint's do not simply
+                // add up from one KiCad to the next: a square box holds either way; and
+                // lines after the first may run on down or be centred on the anchor)
+                let (hw, hh) = if deg != 0.0 || head == "fp_text" {
+                    let m = (wide / 2.0).max(tall / 2.0);
+                    (m, m)
+                } else {
+                    (wide / 2.0, tall / 2.0 + more / 2.0)
+                };
+                out.push((
+                    Shape::Box {
+                        c,
+                        hw,
+                        hh,
+                        deg: angle,
+                        r: 0.0,
+                    },
+                    true,
+                ));
+            }
+            _ => {}
+        }
+        for (shape, text) in out {
+            self.art.push(Art {
+                net: None,
+                shape,
+                layers: layers.clone(),
+                text,
+            });
         }
     }
 
@@ -745,5 +975,80 @@ mod tests {
         assert_eq!(b.pads[0].reference, "U1");
         assert_eq!(b.tracks[0].net.as_deref(), Some("GND"));
         assert_eq!(b.net_codes.get("GND"), Some(&1));
+    }
+    #[test]
+    fn text_and_graphics_on_copper_are_read() {
+        // the box KiCad itself gives 'MOD1' at 109, 96 in a 1 mm font 0.2 thick is
+        // 106.73 to 111.27 across and 95.06 to 96.94 down
+        let t = r#"(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user) (37 "F.SilkS" user))
+          (gr_text "MOD1" (at 109 96 0) (layer "F.Cu") (effects (font (size 1 1) (thickness 0.2))))
+          (gr_text "silk" (at 50 50 0) (layer "F.SilkS") (effects (font (size 1 1) (thickness 0.2))))
+          (gr_text "unseen" (at 60 60 0) (layer "F.Cu") (effects (font (size 1 1) (thickness 0.2)) (hide yes)))
+          (gr_text "AB" (at 20 20 0) (layer "B.Cu") (effects (font (size 2 1) (thickness 0.2)) (justify left mirror)))
+          (gr_line (start 30 30) (end 40 30) (stroke (width 0.5) (type solid)) (layer "F.Cu"))
+          (gr_rect (start 70 70) (end 74 72) (stroke (width 0.2) (type solid)) (fill yes) (layer "B.Cu"))
+          (gr_rect (start 0 0) (end 120 120) (layer "Edge.Cuts")))"#;
+        let b = Board::parse(t.to_string()).unwrap();
+        assert_eq!(b.art.len(), 4, "{:?}", b.art);
+        let mod1 = &b.art[0];
+        assert!(mod1.text && mod1.net.is_none() && mod1.layers == vec![0]);
+        match mod1.shape {
+            Shape::Box { c, hw, hh, deg, .. } => {
+                assert_eq!((c, deg), ((109.0, 96.0), 0.0));
+                // it holds KiCad's box, and is no more than a sixth larger
+                assert!(hw >= 2.27 && hw <= 2.27 * 1.17, "half width {}", hw);
+                assert!(hh >= 0.94 && hh <= 0.94 * 1.17, "half height {}", hh);
+            }
+            other => panic!("{:?}", other),
+        }
+        // mirrored and held by its left end, the words run to the left of the anchor
+        match b.art[1].shape {
+            Shape::Box { c, hw, .. } => {
+                assert_eq!(b.art[1].layers, vec![1]);
+                assert!(c.0 < 20.0 && (c.0 + hw - 20.0).abs() < 1e-9, "{:?} {}", c, hw);
+            }
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(
+            b.art[2].shape,
+            Shape::Capsule {
+                a: (30.0, 30.0),
+                b: (40.0, 30.0),
+                r: 0.25
+            }
+        );
+        assert!(!b.art[2].text);
+        assert_eq!(
+            b.art[3].shape,
+            Shape::Box {
+                c: (72.0, 71.0),
+                hw: 2.1,
+                hh: 1.1,
+                deg: 0.0,
+                r: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn a_footprint_graphic_on_a_pad_takes_its_net() {
+        let t = r#"(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+          (footprint "ANT" (at 10 10) (property "Reference" "A")
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "RF"))
+            (fp_line (start 0 0) (end 5 0) (stroke (width 0.4) (type solid)) (layer "F.Cu"))
+            (fp_line (start 0 4) (end 5 4) (stroke (width 0.4) (type solid)) (layer "F.Cu")))
+          (gr_rect (start 0 0) (end 20 20) (layer "Edge.Cuts")))"#;
+        let b = Board::parse(t.to_string()).unwrap();
+        assert_eq!(b.art.len(), 2);
+        assert_eq!(b.art[0].net.as_deref(), Some("RF"), "it starts on the pad");
+        assert_eq!(b.art[1].net, None, "it touches no pad");
+        assert_eq!(
+            b.art[1].shape,
+            Shape::Capsule {
+                a: (10.0, 14.0),
+                b: (15.0, 14.0),
+                r: 0.2
+            }
+        );
     }
 }

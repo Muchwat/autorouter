@@ -97,6 +97,9 @@ fn copper(board: &Board, routed: Option<&Routed>) -> Vec<Copper> {
     for &h in &board.holes {
         out.push((None, h, all.clone()));
     }
+    for a in &board.art {
+        out.push((a.net.clone(), a.shape, a.layers.clone()));
+    }
     if let Some(r) = routed {
         for t in &r.tracks {
             let shape = Shape::Capsule {

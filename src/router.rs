@@ -3815,6 +3815,17 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
             group: 0,
         });
     }
+    // text and graphics drawn in copper
+    for a in &board.art {
+        obstacles.push(Obstacle {
+            net: a.net.clone(),
+            kind: if a.text { "Text" } else { "Graphic" },
+            shape: a.shape,
+            layers: a.layers.clone(),
+            least: 0.0,
+            group: 0,
+        });
+    }
     let mut groups: HashMap<(Option<String>, &'static str, u64), usize> = HashMap::new();
     let mut net_sig: HashMap<String, String> = HashMap::new();
     for ob in obstacles.iter_mut() {
@@ -5176,6 +5187,38 @@ mod tests {
             kicad_joined(&b, &r, "N"),
             "C is crossed by the track but not joined at its centre"
         );
+    }
+
+    #[test]
+    fn tracks_keep_clear_of_text_drawn_in_copper() {
+        // words in copper lie on the straight line between two pads
+        let s = String::from(HEAD)
+            + &smd("A", "N", 3.0, 10.0, 1.0, 1.0)
+            + &smd("B", "N", 27.0, 10.0, 1.0, 1.0)
+            + "(gr_text \"MADE BY HAND\" (at 15 10 0) (layer \"F.Cu\") (effects (font (size 2 1.5) (thickness 0.3))))\n"
+            + "(gr_line (start 15 14) (end 15 19) (stroke (width 0.5) (type solid)) (layer \"F.Cu\"))\n"
+            + "(gr_rect (start 0 0) (end 30 20) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        assert_eq!(b.art.len(), 2);
+        let opt = Options {
+            no_vias: true,
+            ..Options::default()
+        };
+        let r = route(&b, &rules(), &opt);
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(kicad_joined(&b, &r, "N"));
+        for t in &r.tracks {
+            for a in &b.art {
+                let gap = geom::seg_shape_dist(t.a, t.b, &a.shape) - t.width / 2.0;
+                assert!(
+                    gap >= 0.2 - 1e-6,
+                    "a track {:.3} mm from copper drawn on the board",
+                    gap
+                );
+            }
+        }
+        // (round the words, and on the side the drawn line leaves open)
+        assert!(r.tracks.iter().any(|t| t.a.1 < 8.0), "{:?}", r.tracks);
     }
 
     #[test]
