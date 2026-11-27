@@ -20,7 +20,8 @@ usage: autorouter-bench [options] [BOARD.kicad_pcb ...]
       --repeat         also route each board twice more and check both come out the same
       --save FILE      write the results as JSON
       --baseline FILE  compare with saved results; exit 1 if a board joins fewer nets,
-                       or has more DRC errors or unconnected items, than it did
+                       or has more DRC errors, unconnected items or wide-track vias
+                       left without a second via, than it did
       --work DIR       where to put the routed boards (default: a folder in the temp dir)
   -h, --help           this text
 
@@ -35,6 +36,8 @@ struct Row {
     seconds: f64,
     errors: Option<usize>,
     unconnected: Option<usize>,
+    /// Vias of wide tracks left without a second via beside them.
+    single: usize,
     same: Option<bool>,
     failed: Option<String>,
 }
@@ -75,6 +78,7 @@ fn run(router: &Path, board: &Path, opts: &[String], work: &Path, repeat: bool) 
         seconds: 0.0,
         errors: None,
         unconnected: None,
+        single: 0,
         same: None,
         failed: None,
     };
@@ -121,6 +125,7 @@ fn run(router: &Path, board: &Path, opts: &[String], work: &Path, repeat: bool) 
     row.vias = num(&j, "vias_added") as usize;
     row.track_mm = num(&j, "track_mm");
     row.seconds = num(&j, "seconds");
+    row.single = num(&j, "vias_left_single") as usize;
     if let Some(d) = j.get("drc").filter(|d| d.as_obj().is_some()) {
         row.errors = Some(num(d, "errors") as usize);
         row.unconnected = Some(num(d, "unconnected") as usize);
@@ -198,7 +203,7 @@ fn main() {
     let work = work.unwrap_or_else(|| std::env::temp_dir().join("autorouter-bench"));
 
     println!(
-        "{:<24} {:>5} {:>7} {:>6} {:>5} {:>9} {:>7} {:>7} {:>8}{}",
+        "{:<24} {:>5} {:>7} {:>6} {:>5} {:>9} {:>7} {:>7} {:>8} {:>5}{}",
         "board",
         "nets",
         "joined",
@@ -208,6 +213,7 @@ fn main() {
         "s",
         "errors",
         "unconn.",
+        "lone",
         if repeat { "  repeat" } else { "" }
     );
     let mut rows: Vec<Row> = Vec::new();
@@ -216,7 +222,7 @@ fn main() {
         match &r.failed {
             Some(why) => println!("{:<24} FAILED: {}", r.board, why),
             None => println!(
-                "{:<24} {:>5} {:>7} {:>6.1} {:>5} {:>9.0} {:>7.1} {:>7} {:>8}{}",
+                "{:<24} {:>5} {:>7} {:>6.1} {:>5} {:>9.0} {:>7.1} {:>7} {:>8} {:>5}{}",
                 r.board,
                 r.nets,
                 r.joined,
@@ -230,6 +236,7 @@ fn main() {
                 r.seconds,
                 r.errors.map(|v| v.to_string()).unwrap_or("-".into()),
                 r.unconnected.map(|v| v.to_string()).unwrap_or("-".into()),
+                r.single,
                 match r.same {
                     Some(true) => "    same",
                     Some(false) => "  DIFFER",
@@ -282,6 +289,10 @@ fn main() {
                 bad |= worse("DRC errors", num(b, "errors"), e as f64, true);
                 bad |= worse("unconnected", num(b, "unconnected"), u as f64, true);
             }
+            // (results saved before this was counted have no such number)
+            if let Some(was) = b.get("single").and_then(Json::as_f64) {
+                bad |= worse("wide-track vias left single", was, now.single as f64, true);
+            }
             if bad {
                 status = 1;
             }
@@ -295,7 +306,7 @@ fn main() {
             .iter()
             .map(|r| {
                 format!(
-                    "    {{\"board\": {}, \"nets\": {}, \"joined\": {}, \"vias\": {}, \"track_mm\": {:.1}, \"seconds\": {:.2}, \"errors\": {}, \"unconnected\": {}}}",
+                    "    {{\"board\": {}, \"nets\": {}, \"joined\": {}, \"vias\": {}, \"track_mm\": {:.1}, \"seconds\": {:.2}, \"errors\": {}, \"unconnected\": {}, \"single\": {}}}",
                     json::quote(&r.board),
                     r.nets,
                     r.joined,
@@ -303,7 +314,8 @@ fn main() {
                     r.track_mm,
                     r.seconds,
                     r.errors.unwrap_or(0),
-                    r.unconnected.unwrap_or(0)
+                    r.unconnected.unwrap_or(0),
+                    r.single
                 )
             })
             .collect();

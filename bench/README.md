@@ -12,7 +12,7 @@ target/release/autorouter-bench --list bench/boards.txt --repeat --save bench/re
 
 A list file names one board per line, with any `autorouter` options for that board after the path. `boards.example.txt` shows the form. The boards themselves are not in this repository; point the list at boards of your own.
 
-`--repeat` routes each board twice more and checks that both runs give the same tracks. `--baseline FILE` compares with saved results and exits 1 if any board joins fewer nets, or has more DRC errors or unconnected items, than it did. Run it before and after a change to the router:
+`--repeat` routes each board twice more and checks that both runs give the same tracks. `--baseline FILE` compares with saved results and exits 1 if any board joins fewer nets, or has more DRC errors, unconnected items or wide-track vias left without a second via (the `lone` column), than it did. Run it before and after a change to the router:
 
 ```bash
 target/release/autorouter-bench --list bench/boards.txt --baseline bench/results.json
