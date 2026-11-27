@@ -11,7 +11,7 @@
 
 use crate::board::Board;
 use crate::geom::{self, Shape, P};
-use crate::router::Routed;
+use crate::router::{NewVia, Routed};
 use crate::rules::{Item, Rules};
 
 #[derive(Clone, Debug)]
@@ -360,6 +360,250 @@ pub fn cuts(board: &Board, rules: &Rules, routed: &Routed, grid: f64, nets: Opti
     out
 }
 
+/// A via put in to join a piece of a pour, cut off by new copper, to the rest.
+#[derive(Clone, Debug)]
+pub struct Stitch {
+    pub net: String,
+    pub at: P,
+    /// The pads it joined to the rest again (none: a piece with no pad on it).
+    pub pads: Vec<String>,
+}
+
+/// The grid points inside the board's outline (all of them, if it has none).
+fn inside(board: &Board, gr: &Grid) -> Vec<bool> {
+    let n = gr.w * gr.h;
+    if board.edges.is_empty() {
+        return vec![true; n];
+    }
+    let mut wall = vec![false; n];
+    for &(a, b) in &board.edges {
+        gr.each(&Shape::Capsule { a, b, r: 0.0 }, gr.g * 0.75, |c| wall[c] = true);
+    }
+    // flood from the grid's border, stopped by the edge lines
+    let mut out = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for i in 0..gr.w {
+        stack.push(i);
+        stack.push((gr.h - 1) * gr.w + i);
+    }
+    for j in 0..gr.h {
+        stack.push(j * gr.w);
+        stack.push(j * gr.w + gr.w - 1);
+    }
+    while let Some(c) = stack.pop() {
+        if out[c] || wall[c] {
+            continue;
+        }
+        out[c] = true;
+        let (i, j) = (c % gr.w, c / gr.w);
+        if i > 0 {
+            stack.push(c - 1);
+        }
+        if i + 1 < gr.w {
+            stack.push(c + 1);
+        }
+        if j > 0 {
+            stack.push(c - gr.w);
+        }
+        if j + 1 < gr.h {
+            stack.push(c + gr.w);
+        }
+    }
+    (0..n).map(|c| !out[c] && !wall[c]).collect()
+}
+
+/// Join again what the new copper cut off: where a piece of a pour no longer
+/// reaches the rest of its net, and the net has a pour on another layer that
+/// does, a via of the net is put where the two lie one over the other. The vias
+/// are added to `routed`.
+///
+/// A piece is joined if it has a pad of the net on it, or if the zone keeps
+/// pieces without pads when it is filled and the piece is a square millimetre
+/// or more. Only what was whole before routing is mended; a piece that was
+/// apart already is left as the board's own business. Like the rest of this
+/// file it works on an estimate of the fill, and each via is then checked
+/// exactly against every clearance.
+pub fn stitch(board: &Board, rules: &Rules, routed: &mut Routed, grid: f64, via_in_pad: bool) -> Vec<Stitch> {
+    let mut done: Vec<Stitch> = Vec::new();
+    let nl = board.copper.len();
+    let gr = match fine_grid(board, grid) {
+        Some(g) if nl >= 2 => g,
+        _ => return done,
+    };
+    let n = gr.w * gr.h;
+    let within = inside(board, &gr);
+    let before = copper(board, None);
+    let biggest = |sizes: &[u32]| sizes.iter().enumerate().max_by_key(|(_, s)| **s).map(|(i, _)| i as u32);
+    for net in board.poured_nets() {
+        let (d, drill) = match rules.via(&net) {
+            Some(v) => v,
+            None => continue,
+        };
+        let pads: Vec<&crate::board::Pad> = board
+            .pads
+            .iter()
+            .filter(|p| p.net.as_deref() == Some(net.as_str()))
+            .collect();
+        let keeps = board
+            .zones
+            .iter()
+            .any(|z| z.keepout.is_none() && z.net.as_deref() == Some(net.as_str()) && z.keeps_islands);
+        let (was_pad, was_sizes, was) = labelled(board, rules, &net, &before, &gr);
+        let main_was = match biggest(&was_sizes) {
+            Some(m) => m,
+            None => continue,
+        };
+        let edge = rules.edge_clearance(&net) + d / 2.0;
+        // (a board is not stitched without end: each round adds one via)
+        for _ in 0..64 {
+            let after = copper(board, Some(routed));
+            let (now_pad, now_sizes, now) = labelled(board, rules, &net, &after, &gr);
+            let main_now = match biggest(&now_sizes) {
+                Some(m) => m,
+                None => break,
+            };
+            // the pieces the new copper cut off the main one
+            let mut cut = vec![false; now_sizes.len()];
+            for s in 0..n * nl {
+                if now[s] != u32::MAX && now[s] != main_now && was[s] == main_was {
+                    cut[now[s] as usize] = true;
+                }
+            }
+            let fits = |p: P, piece: u32| -> bool {
+                // in the pour on both layers, all of the via's own copper
+                let mut solid = [false, false];
+                for l in 0..nl {
+                    let layer = &now[l * n..(l + 1) * n];
+                    let (mut on_piece, mut on_main, mut any) = (true, true, false);
+                    gr.each(&Shape::Circle { c: p, r: 0.0 }, d / 2.0, |c| {
+                        any = true;
+                        on_piece &= layer[c] == piece;
+                        on_main &= layer[c] == main_now;
+                    });
+                    solid[0] |= any && on_piece;
+                    solid[1] |= any && on_main;
+                }
+                if !solid[0] || !solid[1] {
+                    return false;
+                }
+                if board.edges.iter().any(|&(a, b)| geom::seg_dist(p, a, b) < edge - 1e-6) {
+                    return false;
+                }
+                for z in &board.zones {
+                    if z.keepout.as_ref().map(|k| k.vias).unwrap_or(false)
+                        && (geom::in_polygon(p, &z.outline) || geom::polygon_edge_dist(p, &z.outline) < d / 2.0 + 1e-6)
+                    {
+                        return false;
+                    }
+                }
+                // its own pads: no hole in a surface-mount one (unless asked), none too near a drilled one
+                for pad in &pads {
+                    let gap = pad.shape.dist(p);
+                    if pad.through && gap < rules.hole_to_hole + drill / 2.0 {
+                        return false;
+                    }
+                    if !pad.through && !via_in_pad && gap < drill / 2.0 + 0.05 {
+                        return false;
+                    }
+                }
+                // holes keep their distance from each other, whatever the net
+                let holes = board
+                    .vias
+                    .iter()
+                    .map(|v| (v.at, v.drill))
+                    .chain(routed.vias.iter().map(|v| (v.at, v.drill)));
+                for (at, h) in holes {
+                    if geom::dist(p, at) < rules.hole_to_hole + (drill + h) / 2.0 - 1e-6 {
+                        return false;
+                    }
+                }
+                // other nets' copper, and holes
+                for (onet, shape, _) in &after {
+                    if onet.as_deref() == Some(net.as_str()) {
+                        continue;
+                    }
+                    let bb = shape.bbox();
+                    if p.0 < bb.0 - 10.0 || p.0 > bb.2 + 10.0 || p.1 < bb.1 - 10.0 || p.1 > bb.3 + 10.0 {
+                        continue;
+                    }
+                    let other = Item {
+                        net: onet.as_deref(),
+                        kind: None,
+                        shape: Some(shape),
+                        layer: None,
+                        paired: None,
+                    };
+                    let mut clr = rules.clearance(&Item::via(&net), &other);
+                    if onet.is_none() {
+                        clr = clr.max(rules.hole_clearance);
+                    }
+                    if shape.dist(p) < clr + d / 2.0 - 1e-6 {
+                        return false;
+                    }
+                }
+                true
+            };
+            let mut added: Option<Stitch> = None;
+            for piece in 0..now_sizes.len() as u32 {
+                if piece == main_now || !cut[piece as usize] {
+                    continue;
+                }
+                let lost: Vec<usize> = (0..pads.len())
+                    .filter(|&k| now_pad[k] == Some(piece) && was_pad[k] == Some(main_was))
+                    .collect();
+                let area = now_sizes[piece as usize] as f64 * gr.g * gr.g;
+                if lost.is_empty() && !(keeps && area >= 1.0) {
+                    continue;
+                }
+                // where the piece lies over (or under) the main one, nearest its pads first
+                let mut spots: Vec<(f64, usize)> = (0..n)
+                    .filter(|&c| {
+                        within[c]
+                            && (0..nl).any(|l| now[l * n + c] == piece)
+                            && (0..nl).any(|l| now[l * n + c] == main_now)
+                    })
+                    .map(|c| {
+                        let p = gr.xy(c);
+                        let near = lost
+                            .iter()
+                            .map(|&k| geom::dist(p, pads[k].shape.centre()))
+                            .fold(f64::INFINITY, f64::min);
+                        (if near.is_finite() { near } else { 0.0 }, c)
+                    })
+                    .collect();
+                spots.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+                // (to the micrometre: the grid's sums leave dust in the last places)
+                let at = |c: usize| {
+                    let p = gr.xy(c);
+                    ((p.0 * 1e6).round() / 1e6, (p.1 * 1e6).round() / 1e6)
+                };
+                if let Some(&(_, c)) = spots.iter().find(|&&(_, c)| fits(at(c), piece)) {
+                    added = Some(Stitch {
+                        net: net.clone(),
+                        at: at(c),
+                        pads: lost.iter().map(|&k| pads[k].name()).collect(),
+                    });
+                    break;
+                }
+            }
+            match added {
+                Some(s) => {
+                    routed.vias.push(NewVia {
+                        net: net.clone(),
+                        at: s.at,
+                        diameter: d,
+                        drill,
+                        layers: (0, nl - 1),
+                    });
+                    done.push(s);
+                }
+                None => break,
+            }
+        }
+    }
+    done
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +643,67 @@ mod tests {
         // on the back there is no pour to cut
         r.tracks[0].layer = 1;
         assert!(cuts(&b, &rules, &r, 0.25, None).is_empty());
+    }
+
+    #[test]
+    fn a_cut_pour_is_joined_again_through_the_other_layer() {
+        // GND is poured on both layers and joined by a via at the left; a new track
+        // right across the front cuts pad B's half off
+        let board = |back: bool| {
+            let t = format!(
+                r#"(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user))
+          (footprint "P" (at 3 5) (property "Reference" "A") (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "GND")))
+          (footprint "P" (at 17 5) (property "Reference" "B") (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "GND")))
+          (via (at 3 8) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net "GND"))
+          (zone (net "GND") (layer "F.Cu") (connect_pads (clearance 0.3)) (min_thickness 0.25)
+            (polygon (pts (xy 0.5 0.5) (xy 19.5 0.5) (xy 19.5 9.5) (xy 0.5 9.5))))
+          {}
+          (gr_rect (start 0 0) (end 20 10) (layer "Edge.Cuts")))"#,
+                if back {
+                    r#"(zone (net "GND") (layer "B.Cu") (connect_pads (clearance 0.3)) (min_thickness 0.25)
+            (polygon (pts (xy 0.5 0.5) (xy 19.5 0.5) (xy 19.5 9.5) (xy 0.5 9.5))))"#
+                } else {
+                    ""
+                }
+            );
+            Board::parse(t).unwrap()
+        };
+        let rules = Rules::default();
+        let across = NewTrack {
+            net: "S".into(),
+            layer: 0,
+            a: (10.0, 0.0),
+            b: (10.0, 10.0),
+            width: 0.25,
+        };
+        let b = board(true);
+        let mut r = Routed::default();
+        assert!(
+            stitch(&b, &rules, &mut r, 0.25, false).is_empty(),
+            "nothing cut, nothing to mend"
+        );
+        r.tracks.push(across.clone());
+        assert_eq!(cuts(&b, &rules, &r, 0.25, None).len(), 1);
+        let done = stitch(&b, &rules, &mut r, 0.25, false);
+        assert_eq!(done.len(), 1, "{:?}", done);
+        assert_eq!(done[0].pads, vec!["B.1".to_string()]);
+        assert_eq!(r.vias.len(), 1);
+        let v = &r.vias[0];
+        assert_eq!((v.net.as_str(), v.layers), ("GND", (0, 1)));
+        // on pad B's side, clear of the track that did the cutting, off the pad, inside the board
+        let clr = rules.clearance(&Item::via("GND"), &Item::track("S"));
+        assert!(v.at.0 - 10.0 >= 0.125 + clr + v.diameter / 2.0 - 1e-9, "{:?}", v.at);
+        assert!(b.pads[1].shape.dist(v.at) > v.drill / 2.0);
+        assert!(v.at.0 < 19.5 && v.at.1 > 0.5 && v.at.1 < 9.5, "{:?}", v.at);
+        assert!(cuts(&b, &rules, &r, 0.25, None).is_empty(), "the pour is whole again");
+        // and once is enough
+        assert!(stitch(&b, &rules, &mut r, 0.25, false).is_empty());
+        // with no pour on the back there is nothing to join the piece to: it stays reported
+        let b = board(false);
+        let mut r = Routed::default();
+        r.tracks.push(across);
+        assert!(stitch(&b, &rules, &mut r, 0.25, false).is_empty());
+        assert!(r.vias.is_empty());
+        assert_eq!(cuts(&b, &rules, &r, 0.25, None).len(), 1);
     }
 }

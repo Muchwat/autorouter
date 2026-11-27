@@ -63,6 +63,9 @@ pub struct Zone {
     /// The zone's own clearance to other nets' copper, and the least width of its copper.
     pub clearance: f64,
     pub min_thickness: f64,
+    /// Whether pieces of the pour that reach no pad are kept when it is filled
+    /// (KiCad's "remove islands" set to anything but "always").
+    pub keeps_islands: bool,
 }
 
 /// How the file names a net inside an item.
@@ -534,6 +537,11 @@ impl Board {
                 .and_then(|c| c.child_num("clearance"))
                 .unwrap_or(0.0),
             min_thickness: z.child_num("min_thickness").unwrap_or(0.25),
+            keeps_islands: z
+                .get("fill")
+                .and_then(|f| f.child_num("island_removal_mode"))
+                .map(|m| m != 0.0)
+                .unwrap_or(false),
         });
     }
 

@@ -56,6 +56,9 @@ usage: autorouter BOARD.kicad_pcb [options]
       --meander MM       the tallest bump of a meander (default 1)
       --double-vias MM   tracks this wide or wider get a second via beside each via
                          (default 0.8; 0: never)
+      --no-stitch        do not mend a pour the new tracks cut (by default a via of the
+                         pour's net joins the piece cut off to the net's pour on another
+                         layer, where the two lie one over the other)
       --no-tidy          leave the tracks as the grid search laid them (by default runs of
                          corners are pulled straight where every clearance allows)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
@@ -205,6 +208,7 @@ fn main() {
         (None::<PathBuf>, None::<PathBuf>, false, false, false, false);
     let mut report: Option<PathBuf> = None;
     let mut keep_widths = false;
+    let mut stitch = true;
     let mut layer_names: Option<Vec<String>> = None;
     let mut span_names: Vec<String> = Vec::new();
     let mut any_span = false;
@@ -224,6 +228,7 @@ fn main() {
             "--include-poured" | "--include-zone-nets" => opt.include_poured = true,
             "--rip" => rip = true,
             "--keep-widths" => keep_widths = true,
+            "--no-stitch" => stitch = false,
             "--layers" => layer_names = Some(list(&value(&mut i, &a))),
             "--via-spans" => span_names.extend(list(&value(&mut i, &a))),
             "--blind-vias" => any_span = true,
@@ -407,7 +412,14 @@ fn main() {
     }
 
     let t0 = Instant::now();
-    let result = router::route(&board, &rules, &opt);
+    let mut result = router::route(&board, &rules, &opt);
+    // pours the new copper cut are joined again with a via, where the net has a
+    // pour on another layer to join them to
+    let stitches = if stitch {
+        pour::stitch(&board, &rules, &mut result, opt.grid, opt.via_in_pad)
+    } else {
+        Vec::new()
+    };
     let secs = t0.elapsed().as_secs_f64();
 
     let output = output.unwrap_or_else(|| {
@@ -614,6 +626,24 @@ fn main() {
             }
         );
     }
+    if !stitches.is_empty() {
+        let with_pads: Vec<String> = stitches.iter().flat_map(|s| s.pads.iter().cloned()).collect();
+        println!(
+            "  pours cut by the new tracks and joined again: {} via(s) ({}){}",
+            stitches.len(),
+            {
+                let mut nets: Vec<&str> = stitches.iter().map(|s| s.net.as_str()).collect();
+                nets.sort();
+                nets.dedup();
+                nets.join(", ")
+            },
+            if with_pads.is_empty() {
+                String::new()
+            } else {
+                format!("; pads joined again: {}", with_pads.join(", "))
+            }
+        );
+    }
     // pours the new copper may have cut (an estimate on the grid; KiCad's fill decides)
     let cuts = if changed {
         pour::cuts(&board, &rules, &result, opt.grid, None)
@@ -623,7 +653,7 @@ fn main() {
     for c in &cuts {
         println!(
             "  WARNING the {} pour looks cut by the new tracks: {} of {} pads off the main piece ({}{}). \
-             Check with --drc; stitching vias or --include-poured can join them",
+             Check with --drc; a stitching via by hand or --include-poured can join them",
             c.net,
             c.cut_off.len(),
             c.pads,
@@ -678,7 +708,7 @@ fn main() {
         let text = format!(
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
              \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \"blind_vias\": {},\n  \"buried_vias\": {},\n  \
-             \"plane_nets\": {},\n  \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
+             \"plane_nets\": {},\n  \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"stitch_vias\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
              \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {},\n  \
              \"ripped_nets\": {},\n  \"new_tracks\": {},\n  \"new_vias\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
@@ -698,6 +728,7 @@ fn main() {
             result.fanouts.iter().filter(|f| f.via.is_some()).count(),
             result.doubled,
             result.single.len(),
+            stitches.len(),
             removed,
             list(left
                 .iter()
