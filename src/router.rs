@@ -107,8 +107,8 @@ impl Default for Options {
         Options {
             grid: 0.25,
             margin: 0.05,
-            passes: 40,
-            stall: 5,
+            passes: 100,
+            stall: 15,
             via_cost: 12.0,
             limit: 2_000_000,
             nets: None,
@@ -3511,6 +3511,36 @@ pub fn wanted(board: &Board, opt: &Options, net: &str) -> bool {
     opt.include_poured || !board.poured_nets().iter().any(|p| p == net)
 }
 
+/// The grid a board's own pads stand on, if they do: 0.254 mm where four pads
+/// in five are on that lattice, 0.127 mm where two in five are (a board of
+/// 0.1 inch parts, laid out in mils). On such a board tracks on the same
+/// lattice pass between the pins where a 0.25 mm grid mostly misses the gaps.
+/// None: no such lattice (route on the usual grid).
+pub fn lattice_grid(board: &Board) -> Option<f64> {
+    let n = board.pads.len();
+    if n < 8 {
+        return None;
+    }
+    let on = |g: f64| {
+        board
+            .pads
+            .iter()
+            .filter(|p| {
+                let c = p.shape.centre();
+                ((c.0 / g) - (c.0 / g).round()).abs() < 2e-3 && ((c.1 / g) - (c.1 / g).round()).abs() < 2e-3
+            })
+            .count() as f64
+            / n as f64
+    };
+    if on(0.254) >= 0.8 {
+        Some(0.254)
+    } else if on(0.127) >= 0.4 {
+        Some(0.127)
+    } else {
+        None
+    }
+}
+
 /// The width each net's tracks on the board mostly have, by length: for the
 /// nets that would be routed, from their tracks as they are now (locked or not).
 /// Given as `Options::kept_widths`, a net taken up and routed again keeps it.
@@ -5187,6 +5217,33 @@ mod tests {
             kicad_joined(&b, &r, "N"),
             "C is crossed by the track but not joined at its centre"
         );
+    }
+
+    #[test]
+    fn a_board_laid_out_in_mils_is_routed_on_its_own_lattice() {
+        let board = |pitch: f64, off: f64| {
+            let mut s = String::from(HEAD);
+            for k in 0..12 {
+                s += &smd(
+                    &format!("P{}", k),
+                    &format!("N{}", k),
+                    off + pitch * (k % 4) as f64,
+                    off + pitch * (k / 4) as f64,
+                    1.0,
+                    1.0,
+                );
+            }
+            s += "(gr_rect (start 0 0) (end 30 30) (layer \"Edge.Cuts\")))";
+            Board::parse(s).unwrap()
+        };
+        // 0.1 inch pitch from a 0.1 inch origin: on the 0.254 mm lattice
+        assert_eq!(lattice_grid(&board(2.54, 5.08)), Some(0.254));
+        // the same, half a step of that off: only the 0.127 mm lattice holds them
+        assert_eq!(lattice_grid(&board(2.54, 5.08 + 0.127)), Some(0.127));
+        // metric parts
+        assert_eq!(lattice_grid(&board(2.0, 5.0)), None);
+        // too few pads to say
+        assert_eq!(lattice_grid(&pair_board("")), None);
     }
 
     #[test]

@@ -22,7 +22,11 @@ usage: autorouter BOARD.kicad_pcb [options]
                          (by length), not the rules' width; with --rip, the width of the
                          tracks taken up. Nets with no tracks yet follow the rules
       --layers F.Cu,B.Cu copper layers to use (default: all)
-      --grid MM          grid pitch (default 0.25; 0.254 suits 0.1 inch through-hole parts)
+      --grid MM          grid pitch, and no other is tried. Without it: the lattice the
+                         board's own pads stand on (0.254 or 0.127 mm, for 0.1 inch
+                         parts), else 0.25; and if anything is left unjoined, finer grids
+                         are tried (to 0.1 mm, on boards not too large for them, for
+                         five minutes at most) and the best result kept
       --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
                          raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
@@ -63,7 +67,8 @@ usage: autorouter BOARD.kicad_pcb [options]
                          corners are pulled straight where every clearance allows)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
       --via-cost N       what a via costs, in grid steps (default 12)
-      --passes N         most negotiation passes (default 40)
+      --passes N         most negotiation passes (default 100; it stops sooner once 15
+                         passes in a row bring no fewer conflicts)
       --drc              refill the zones and check the result with KiCad's DRC (kicad-cli),
                          custom rules included; the refilled board is what gets written
       --keep-fills       leave the zones' old fills in the output (they are removed by
@@ -209,6 +214,7 @@ fn main() {
     let mut report: Option<PathBuf> = None;
     let mut keep_widths = false;
     let mut stitch = true;
+    let mut grid_given = false;
     let mut layer_names: Option<Vec<String>> = None;
     let mut span_names: Vec<String> = Vec::new();
     let mut any_span = false;
@@ -235,7 +241,10 @@ fn main() {
             "--no-fanout" => opt.fanout = false,
             "--no-plane-vias" => opt.plane_vias = false,
             "--fanout-length" => opt.fanout_length = mm(&value(&mut i, &a), &a),
-            "--grid" => opt.grid = mm(&value(&mut i, &a), &a),
+            "--grid" => {
+                opt.grid = mm(&value(&mut i, &a), &a);
+                grid_given = true;
+            }
             "--margin" => {
                 opt.margin = value(&mut i, &a)
                     .parse::<f64>()
@@ -412,7 +421,59 @@ fn main() {
     }
 
     let t0 = Instant::now();
+    // the grid: the one asked for. Else the lattice the board's own pads stand on, or
+    // 0.25 mm; and if that leaves anything unjoined, finer ones (0.2, 0.125, 0.1 mm,
+    // while the board is not too large for them and five minutes are not up), keeping
+    // the best (a finer grid finds ways a coarser one misses, at more time and memory)
+    if !grid_given {
+        if let Some(g) = router::lattice_grid(&board) {
+            opt.grid = g;
+            if opt.progress {
+                eprintln!(
+                    "most of the pads stand on a {} mm lattice: routing on that grid (--grid chooses another)",
+                    g
+                );
+            }
+        }
+    }
     let mut result = router::route(&board, &rules, &opt);
+    if !grid_given {
+        let unjoined = |r: &router::Routed| r.nets.iter().map(|n| n.unrouted.len()).sum::<usize>();
+        let (bx0, by0, bx1, by1) = board.extent().unwrap_or((0.0, 0.0, 0.0, 0.0));
+        for g in [0.2, 0.125, 0.1] {
+            if unjoined(&result) == 0 || t0.elapsed().as_secs_f64() > 300.0 {
+                break;
+            }
+            if g >= opt.grid - 1e-9 {
+                continue;
+            }
+            // (not where the grid would be too large to route in reasonable time and memory)
+            let cells = ((bx1 - bx0 + 2.0) / g) * ((by1 - by0 + 2.0) / g) * board.copper.len() as f64;
+            if cells > 3.0e6 {
+                break;
+            }
+            if opt.progress {
+                eprintln!(
+                    "{} piece(s) left unjoined on the {} mm grid: trying {} mm",
+                    unjoined(&result),
+                    opt.grid,
+                    g
+                );
+            }
+            let finer = Options { grid: g, ..opt.clone() };
+            let again = router::route(&board, &rules, &finer);
+            if unjoined(&again) < unjoined(&result) {
+                result = again;
+                opt.grid = g;
+            } else if opt.progress {
+                eprintln!(
+                    "no better ({} left): keeping the {} mm grid's result",
+                    unjoined(&again),
+                    opt.grid
+                );
+            }
+        }
+    }
     // pours the new copper cut are joined again with a via, where the net has a
     // pour on another layer to join them to
     let stitches = if stitch {

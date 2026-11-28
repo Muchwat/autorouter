@@ -12,6 +12,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 ## What it does
 
 - **Every net at once.** Nets are routed together and bargain for space (negotiated congestion, the PathFinder scheme of McMurchie and Ebeling, 1995). A spot two nets both want gets dearer each pass, and only the nets still in conflict are routed again. So the order nets come in does not decide whether a board finishes.
+- **It picks its grid.** Unless you name one, the router looks where the board's pads stand: a board of 0.1 inch parts is routed on its own lattice (0.254 or 0.127 mm), where tracks pass between the pins, and any other on 0.25 mm. If that leaves anything unjoined it tries finer grids, down to 0.1 mm on boards not too large for them, and keeps the best result. So a board the usual grid routes whole costs nothing extra, and a fine-pitch one gets the grid it needs.
 - **Always legal.** If the passes run out with nets still in conflict, those nets are routed once more with everyone else's copper as walls. A net may be left unjoined, but tracks never overlap or break a clearance the router knows about.
 - **KiCad's rules, per net pair.** Clearance between two items is worked out the way KiCad's DRC does it: the larger net-class clearance, overridden by the last custom rule that matches, never below the board minimum.
 - **Existing copper is kept.** Pads, tracks and vias of other nets are obstacles. A net's own copper already joins what it reaches, counted the way KiCad counts it (a track's end, or a via's or pad's centre, on the other item), so only the missing links are routed. Locked items stay even with `--rip`.
@@ -60,7 +61,11 @@ autorouter BOARD.kicad_pcb [options]
                          (by length), not the rules' width; with --rip, the width of the
                          tracks taken up. Nets with no tracks yet follow the rules
       --layers F.Cu,B.Cu copper layers to use (default: all)
-      --grid MM          grid pitch (default 0.25; 0.254 suits 0.1 inch through-hole parts)
+      --grid MM          grid pitch, and no other is tried. Without it: the lattice the
+                         board's own pads stand on (0.254 or 0.127 mm, for 0.1 inch
+                         parts), else 0.25; and if anything is left unjoined, finer grids
+                         are tried (to 0.1 mm, on boards not too large for them, for
+                         five minutes at most) and the best result kept
       --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
                          raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
@@ -102,7 +107,8 @@ autorouter BOARD.kicad_pcb [options]
       --report FILE      write what was done as JSON (for scripts and benchmarks), with
                          every track and via added and the nets whose tracks were taken up
       --via-cost N       what a via costs, in grid steps (default 12)
-      --passes N         most negotiation passes (default 40)
+      --passes N         most negotiation passes (default 100; it stops sooner once 15
+                         passes in a row bring no fewer conflicts)
       --drc              refill the zones and check the result with KiCad's DRC (kicad-cli),
                          custom rules included; the refilled board is what gets written
       --keep-fills       leave the zones' old fills in the output (they are removed by
@@ -181,6 +187,23 @@ The five boards above have no BGA: the fan-out is used for one pad on them (on t
 Joining pads to planes was tried on the vehicle tracker with every track and via of its GND and +3V3 nets taken out first (456 vias among them), which leaves 110 pads unconnected. The router joined all 165 loose pieces to the two planes, GND with 82 vias and +3V3 with 44, and KiCad then finds no pad unconnected; the two items it still lists are pieces of the front pour with no pad on them.
 
 The mains board is the case per-pair rules are for. Routed whole, mains included, it needs 8 mm from mains to low voltage and 2.5 mm between mains nets at once, which one net-class clearance cannot say. That run also comes out with 0 errors and 0 unconnected.
+
+### Beside Freerouting, on boards it had never seen
+
+Six of the demo boards that come with KiCad 10, each with the tracks of every net that has no pour taken out, then routed by this router and by [Freerouting](https://github.com/freerouting/freerouting) 2.6.0 (its defaults, at most 100 passes, through KiCad's Specctra export and import). Both results were checked by KiCad's DRC; "new errors" are those the unrouted board did not have. Times are each program's own run on the same machine.
+
+| Board | This router: left open | new errors | time | Freerouting: left open | new errors | time |
+|---|---|---|---|---|---|---|
+| ecc83-pp_v2, 2 layers, 8 nets | 0 | 0 | 0.1 s | 0 | 0 | 0.5 s |
+| pic_programmer, 2 layers, 33 nets | 2 | 0 | 10 s | 1 | 27 | 19 s |
+| interf_u, 2 layers, 109 nets | 3 | 4 | 52 s | 0 | 3 | 127 s |
+| StickHub, 2 layers, 42 nets, 0.5 mm pitch | 12 | 9 | 20 s | 5 | 4 | 626 s |
+| RoyalBlue54L-Feather, 8 layers, 5 nets left to route | 2 | 0 | 20 s | 0 | 5 | 176 s |
+| kit-dev-coldfire-xilinx_5213, 4 layers, 207 nets | 2 | 0 | 279 s | no result in 25 minutes | | |
+
+Freerouting joins more: it leaves fewer connections open on four of the five boards both finished, and on interf_u it does so with half the vias. This router is the quicker by far and the only one to finish the largest board, and it breaks fewer rules; Freerouting's errors are mostly tracks narrower than the board allows. What this router still leaves open is, in the main, pads of fine-pitch parts shut in by their neighbours' tracks, and pads cut off a pour that is on one layer only. Its errors here are thermal reliefs on such cut pours and vias under openings drawn in the solder mask, which it does not read.
+
+A seventh demo, video (4 layers, 369 nets), is beyond it for now: 289 nets joined in 15 minutes and 5 GB.
 
 ## Limits
 
