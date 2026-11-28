@@ -10,7 +10,7 @@ from . import core
 
 class OptionsDialog(wx.Dialog):
     def __init__(self, parent, settings, board):
-        super().__init__(parent, title="Autoroute", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        super().__init__(parent, title="Antnest", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.settings = settings
         s = settings
         pad = 6
@@ -35,7 +35,7 @@ class OptionsDialog(wx.Dialog):
             "The vias your board house makes, each by the two layers it joins: F.Cu-In1.Cu,In2.Cu-B.Cu. "
             "Empty: through vias only. This board's copper layers: " + layers,
         )
-        self.extra = text("More options", s.extra, "Any other option of the autorouter command, as typed on its command line.")
+        self.extra = text("More options", s.extra, "Any other option of the antnest command, as typed on its command line.")
         box.Add(grid, 0, wx.EXPAND | wx.ALL, pad * 2)
 
         def check(label, value, tip):
@@ -55,7 +55,7 @@ class OptionsDialog(wx.Dialog):
         prog = wx.BoxSizer(wx.HORIZONTAL)
         prog.Add(wx.StaticText(self, label="Router program"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, pad * 2)
         found = core.find_program(s) or ""
-        self.program = wx.FilePickerCtrl(self, path=s.program or found, message="The autorouter program")
+        self.program = wx.FilePickerCtrl(self, path=s.program or found, message="The antnest program")
         self.program.SetToolTip("Found by itself on PATH or in ~/.cargo/bin; set it here if it is elsewhere.")
         prog.Add(self.program, 1, wx.EXPAND)
         box.Add(prog, 0, wx.EXPAND | wx.ALL, pad * 2)
@@ -98,7 +98,7 @@ def run(parent):
 
     # the router runs in its own process; this window shows its last line meanwhile
     progress = wx.ProgressDialog(
-        "Autoroute",
+        "Antnest",
         "Starting the router...",
         parent=parent,
         style=wx.PD_APP_MODAL | wx.PD_CAN_ABORT | wx.PD_ELAPSED_TIME,
@@ -110,7 +110,7 @@ def run(parent):
         job = core.prepare(board, settings)
     except Exception as e:
         progress.Destroy()
-        wx.MessageBox(str(e), "Autoroute", wx.OK | wx.ICON_ERROR, parent)
+        wx.MessageBox(str(e), "Antnest", wx.OK | wx.ICON_ERROR, parent)
         return
 
     def work():
@@ -132,13 +132,13 @@ def run(parent):
     if isinstance(done.get("error"), core.Cancelled):
         return
     if "error" in done:
-        wx.MessageBox(str(done["error"]), "Autoroute", wx.OK | wx.ICON_ERROR, parent)
+        wx.MessageBox(str(done["error"]), "Antnest", wx.OK | wx.ICON_ERROR, parent)
         return
     result = done["result"]
     try:
         applied = core.apply(board, result.report)
     except Exception as e:
-        wx.MessageBox("The route could not be put on the board: %s" % e, "Autoroute", wx.OK | wx.ICON_ERROR, parent)
+        wx.MessageBox("The route could not be put on the board: %s" % e, "Antnest", wx.OK | wx.ICON_ERROR, parent)
         return
     finally:
         result.clean()
@@ -146,7 +146,7 @@ def run(parent):
     text = core.summary(result, applied)
     wx.MessageBox(
         text,
-        "Autoroute",
+        "Antnest",
         wx.OK | (wx.ICON_INFORMATION if result.status == 0 else wx.ICON_WARNING),
         parent,
     )

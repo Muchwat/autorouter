@@ -15,7 +15,7 @@ import sys
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PLUGIN = os.path.join(HERE, "autorouter_plugin")
+PLUGIN = os.path.join(HERE, "antnest_plugin")
 
 # colours (KiCad's own, roughly: front copper red, back copper blue, pads gold)
 FRONT = (200, 60, 52)

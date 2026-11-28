@@ -1,24 +1,24 @@
 [package]
-name = "autorouter"
-version = "0.10.0"
+name = "antnest"
+version = "0.11.0"
 edition = "2021"
 description = "A grid autorouter for KiCad boards: negotiated congestion, per-net-pair clearance from KiCad's own rules"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Muchwat/autorouter"
+repository = "https://github.com/Muchwat/antnest"
 readme = "README.md"
 keywords = ["kicad", "pcb", "autorouter", "eda"]
 categories = ["command-line-utilities", "science"]
 
 [[bin]]
-name = "autorouter"
+name = "antnest"
 path = "src/main.rs"
 
 [[bin]]
-name = "autorouter-bench"
+name = "antnest-bench"
 path = "src/bin/bench.rs"
 
 [lib]
-name = "autorouter"
+name = "antnest"
 path = "src/lib.rs"
 
 [dependencies]

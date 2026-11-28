@@ -1,4 +1,4 @@
-"""The plugin's work, without any window: run the autorouter on a copy of the
+"""The plugin's work, without any window: run antnest on a copy of the
 open board, then put what it laid on the board itself.
 
 The router never touches the open board or its file. The board as it stands in
@@ -9,7 +9,7 @@ open board, so the whole run is one step that Undo takes back.
 
 Kept free of wx so it can be tried headless, with KiCad's own Python:
 
-    from autorouter_plugin import core
+    from antnest_plugin import core
     board = pcbnew.LoadBoard("my.kicad_pcb")
     result = core.route(board, core.Settings())
     core.apply(board, result.report)
@@ -26,7 +26,7 @@ import threading
 
 import pcbnew
 
-SETTINGS_FILE = "autorouter.json"
+SETTINGS_FILE = "antnest.json"
 
 
 class Settings:
@@ -84,11 +84,14 @@ class Settings:
 
     @classmethod
     def load(cls):
-        try:
-            with open(cls.path()) as f:
-                return cls(**json.load(f))
-        except Exception:
-            return cls()
+        # (the settings of the plugin's earlier name, autorouter, are taken over once)
+        for name in (SETTINGS_FILE, "autorouter.json"):
+            try:
+                with open(os.path.join(os.path.dirname(cls.path()), name)) as f:
+                    return cls(**json.load(f))
+            except Exception:
+                continue
+        return cls()
 
     def save(self):
         try:
@@ -99,13 +102,13 @@ class Settings:
 
 
 def find_program(settings):
-    """The autorouter program: as set, $AUTOROUTER, on PATH, or where cargo
+    """The antnest program: as set, $ANTNEST, on PATH, or where cargo
     installs it (KiCad started from the Dock or Start menu has a short PATH)."""
-    exe = "autorouter.exe" if sys.platform == "win32" else "autorouter"
-    places = [settings.program, os.environ.get("AUTOROUTER", ""), shutil.which("autorouter") or ""]
+    exe = "antnest.exe" if sys.platform == "win32" else "antnest"
+    places = [settings.program, os.environ.get("ANTNEST", ""), shutil.which("antnest") or ""]
     places.append(os.path.join(os.path.expanduser("~"), ".cargo", "bin", exe))
     if sys.platform != "win32":
-        places += ["/opt/homebrew/bin/autorouter", "/usr/local/bin/autorouter"]
+        places += ["/opt/homebrew/bin/antnest", "/usr/local/bin/antnest"]
     for p in places:
         if p and os.path.isfile(p) and os.access(p, os.X_OK):
             return p
@@ -147,10 +150,10 @@ def prepare(board, settings):
     program = find_program(settings)
     if not program:
         raise RuntimeError(
-            "the autorouter program was not found. Install it with "
-            "'cargo install --path .' in the autorouter folder, or set its path in this dialog"
+            "the antnest program was not found. Install it with "
+            "'cargo install --path .' in the antnest folder, or set its path in this dialog"
         )
-    folder = tempfile.mkdtemp(prefix="autorouter-")
+    folder = tempfile.mkdtemp(prefix="antnest-")
     source = board.GetFileName()
     stem = os.path.splitext(os.path.basename(source))[0] if source else "board"
     copy = os.path.join(folder, stem + ".kicad_pcb")

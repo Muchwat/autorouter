@@ -1,7 +1,7 @@
 //! Print every pad as the router reads it: name, net, centre and bounding box.
 //!
 //!     cargo run --example pads -- board.kicad_pcb
-use autorouter::board::Board;
+use antnest::board::Board;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: pads BOARD.kicad_pcb");

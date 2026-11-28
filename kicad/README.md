@@ -1,16 +1,16 @@
-# Autoroute plugin for KiCad
+# Antnest plugin for KiCad
 
-Runs the [autorouter](../README.md) on the board open in KiCad's PCB editor and puts the tracks and vias it lays on that board, as one step that Undo takes back.
+Runs [antnest](../README.md), the autorouter, on the board open in KiCad's PCB editor and puts the tracks and vias it lays on that board, as one step that Undo takes back.
 
 ## Install
 
 1. The router itself, from this repository or straight from GitHub:
 
    ```bash
-   cargo install --git https://github.com/Muchwat/autorouter
+   cargo install --git https://github.com/Muchwat/antnest
    ```
 
-   It goes into `~/.cargo/bin`, where the plugin looks for it. If it is somewhere else, set its path in the plugin's dialog, or set `AUTOROUTER` to it.
+   It goes into `~/.cargo/bin`, where the plugin looks for it. If it is somewhere else, set its path in the plugin's dialog, or set `ANTNEST` to it.
 
 2. The plugin, into the newest KiCad found on this computer:
 
@@ -18,7 +18,7 @@ Runs the [autorouter](../README.md) on the board open in KiCad's PCB editor and 
    python3 kicad/install.py
    ```
 
-   `--kicad 9.0` picks another version, `--link` links to this folder instead of copying (for working on the plugin), and `--remove` takes it out. You can also copy `kicad/autorouter_plugin` by hand into KiCad's `scripting/plugins` folder (Preferences > Configure Paths shows where that is).
+   `--kicad 9.0` picks another version, `--link` links to this folder instead of copying (for working on the plugin), and `--remove` takes it out. You can also copy `kicad/antnest_plugin` by hand into KiCad's `scripting/plugins` folder (Preferences > Configure Paths shows where that is).
 
    Or build a package for KiCad's Plugin and Content Manager and use its **Install from File...**:
 
@@ -30,7 +30,7 @@ Runs the [autorouter](../README.md) on the board open in KiCad's PCB editor and 
 
 ## Use
 
-**Tools > External Plugins > Autoroute**, or the toolbar button. The dialog asks:
+**Tools > External Plugins > Antnest**, or the toolbar button. The dialog asks:
 
 | Field | Router option |
 |---|---|
@@ -45,7 +45,7 @@ Runs the [autorouter](../README.md) on the board open in KiCad's PCB editor and 
 | Lay tracks on inner plane layers too | `--tracks-on-planes` |
 | Also route nets that have a copper pour | `--include-poured` |
 
-The settings are remembered, in `autorouter.json` beside KiCad's own settings.
+The settings are remembered, in `antnest.json` beside KiCad's own settings.
 
 What happens when you press Route:
 

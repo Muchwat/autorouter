@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pcbnew  # noqa: E402
 
-from autorouter_plugin import core  # noqa: E402
+from antnest_plugin import core  # noqa: E402
 
 
 def kicad_cli():

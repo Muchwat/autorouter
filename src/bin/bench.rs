@@ -1,22 +1,22 @@
-//! autorouter-bench: route a set of boards from nothing and score the result.
+//! antnest-bench: route a set of boards from nothing and score the result.
 //!
-//! Each board has its tracks ripped up and routed again by the `autorouter`
+//! Each board has its tracks ripped up and routed again by the `antnest`
 //! beside this program, the result is checked by KiCad's DRC, and one line per
 //! board says how it went. Saved results can be compared with an earlier run,
 //! so a change to the router that loses nets or adds DRC errors is caught.
 
-use autorouter::json::{self, Json};
+use antnest::json::{self, Json};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
 const USAGE: &str = "\
-autorouter-bench: route boards from nothing and score the result with KiCad's DRC
+antnest-bench: route boards from nothing and score the result with KiCad's DRC
 
-usage: autorouter-bench [options] [BOARD.kicad_pcb ...]
+usage: antnest-bench [options] [BOARD.kicad_pcb ...]
 
-      --list FILE      boards to run, one per line: a path, then any autorouter options
+      --list FILE      boards to run, one per line: a path, then any antnest options
                        for that board (lines starting with # are skipped)
-      --opts \"...\"     autorouter options for the boards named on the command line
+      --opts \"...\"     antnest options for the boards named on the command line
       --repeat         also route each board twice more and check both come out the same
       --save FILE      write the results as JSON
       --baseline FILE  compare with saved results; exit 1 if a board joins fewer nets,
@@ -43,7 +43,7 @@ struct Row {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("autorouter-bench: {}", msg);
+    eprintln!("antnest-bench: {}", msg);
     exit(2)
 }
 
@@ -193,14 +193,14 @@ fn main() {
         die("no boards given (see --help)");
     }
     let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("cannot find myself: {}", e)));
-    let router = exe.with_file_name(format!("autorouter{}", std::env::consts::EXE_SUFFIX));
+    let router = exe.with_file_name(format!("antnest{}", std::env::consts::EXE_SUFFIX));
     if !router.exists() {
         die(&format!(
             "{} is not there: build it first (cargo build --release)",
             router.display()
         ));
     }
-    let work = work.unwrap_or_else(|| std::env::temp_dir().join("autorouter-bench"));
+    let work = work.unwrap_or_else(|| std::env::temp_dir().join("antnest-bench"));
 
     println!(
         "{:<24} {:>5} {:>7} {:>6} {:>5} {:>9} {:>7} {:>7} {:>8} {:>5}{}",

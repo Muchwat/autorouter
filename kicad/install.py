@@ -1,4 +1,4 @@
-"""Install the Autoroute plugin into KiCad's plugin folder.
+"""Install the Antnest plugin into KiCad's plugin folder.
 
     python3 kicad/install.py            copy it into the newest KiCad found
     python3 kicad/install.py --link     link it instead (changes here show in KiCad)
@@ -6,7 +6,7 @@
     python3 kicad/install.py --remove
 
 Then restart the PCB editor, or use Tools > External Plugins > Refresh Plugins.
-The plugin runs the autorouter program, which it looks for on PATH and in
+The plugin runs the antnest program, which it looks for on PATH and in
 ~/.cargo/bin; install that with `cargo install --path .` in this repository.
 """
 
@@ -16,7 +16,7 @@ import shutil
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-NAME = "autorouter_plugin"
+NAME = "antnest_plugin"
 
 
 def kicad_roots():
@@ -45,7 +45,7 @@ def versions():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Install the Autoroute plugin into KiCad.")
+    ap = argparse.ArgumentParser(description="Install the Antnest plugin into KiCad.")
     ap.add_argument("--kicad", help="the KiCad version to install for, such as 10.0 (default: the newest found)")
     ap.add_argument("--link", action="store_true", help="link to this folder instead of copying")
     ap.add_argument("--remove", action="store_true", help="take the plugin out again")
@@ -72,12 +72,12 @@ def main():
     else:
         shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     print("installed for KiCad %s: %s" % (version, target))
-    exe = "autorouter.exe" if sys.platform == "win32" else "autorouter"
+    exe = "antnest.exe" if sys.platform == "win32" else "antnest"
     cargo = os.path.join(os.path.expanduser("~"), ".cargo", "bin", exe)
-    if not (shutil.which("autorouter") or os.path.isfile(cargo)):
-        print("note: the autorouter program is not on PATH or in ~/.cargo/bin yet. Install it with\n"
+    if not (shutil.which("antnest") or os.path.isfile(cargo)):
+        print("note: the antnest program is not on PATH or in ~/.cargo/bin yet. Install it with\n"
               "  cargo install --path \"%s\"\nor set its path in the plugin's dialog." % os.path.dirname(HERE))
-    print("Restart the PCB editor (or Tools > External Plugins > Refresh Plugins); then Tools > External Plugins > Autoroute.")
+    print("Restart the PCB editor (or Tools > External Plugins > Refresh Plugins); then Tools > External Plugins > Antnest.")
 
 
 if __name__ == "__main__":

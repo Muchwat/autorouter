@@ -1,6 +1,6 @@
-"""KiCad action plugin: route the open board with the autorouter.
+"""KiCad action plugin: route the open board with antnest.
 
-Appears in the PCB editor under Tools > External Plugins > Autoroute, and as a
+Appears in the PCB editor under Tools > External Plugins > Antnest, and as a
 toolbar button. See the README in this folder.
 """
 
@@ -9,9 +9,9 @@ import os
 import pcbnew
 
 
-class Autoroute(pcbnew.ActionPlugin):
+class Antnest(pcbnew.ActionPlugin):
     def defaults(self):
-        self.name = "Autoroute"
+        self.name = "Antnest"
         self.category = "Routing"
         self.description = "Route the nets not yet joined, keeping to the board's own design rules"
         self.show_toolbar_button = True
@@ -27,6 +27,6 @@ class Autoroute(pcbnew.ActionPlugin):
 
 
 try:
-    Autoroute().register()
+    Antnest().register()
 except Exception:
     pass  # imported outside the PCB editor (a script, a test): nothing to register with

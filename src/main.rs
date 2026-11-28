@@ -1,16 +1,16 @@
-use autorouter::board::Board;
-use autorouter::router::{self, Options};
-use autorouter::rules::Rules;
-use autorouter::write;
-use autorouter::{json, pour};
+use antnest::board::Board;
+use antnest::router::{self, Options};
+use antnest::rules::Rules;
+use antnest::write;
+use antnest::{json, pour};
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 use std::time::Instant;
 
 const USAGE: &str = "\
-autorouter: route a KiCad board, keeping to its own design rules
+antnest: route a KiCad board, keeping to its own design rules
 
-usage: autorouter BOARD.kicad_pcb [options]
+usage: antnest BOARD.kicad_pcb [options]
 
   -o, --output FILE      where to write the routed board (default BOARD-routed.kicad_pcb)
       --nets A,B         route only these nets (wildcards: '/SPI_*')
@@ -82,7 +82,7 @@ custom rules in BOARD.kicad_dru. Exit status: 0 when every net is joined (and, w
 KiCad finds no errors), 1 when something is left, 2 on bad input.";
 
 fn die(msg: &str) -> ! {
-    eprintln!("autorouter: {}", msg);
+    eprintln!("antnest: {}", msg);
     exit(2)
 }
 
@@ -141,7 +141,7 @@ struct Drc {
 fn drc(pcb: &Path, rules_from: &Path) -> Result<Drc, String> {
     let cli = kicad_cli().ok_or("kicad-cli not found (set KICAD_CLI to its path)")?;
     // in a folder of its own, named like the original so its .kicad_pro and .kicad_dru apply
-    let dir = std::env::temp_dir().join(format!("autorouter-drc-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("antnest-drc-{}", std::process::id()));
     let result = drc_in(&cli, &dir, pcb, rules_from);
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -782,7 +782,7 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("autorouter: DRC not run: {}", e);
+                eprintln!("antnest: DRC not run: {}", e);
                 status = 1;
             }
         }
@@ -923,7 +923,7 @@ fn main() {
                 .collect()),
         );
         if let Err(e) = std::fs::write(&path, text) {
-            eprintln!("autorouter: cannot write {}: {}", path.display(), e);
+            eprintln!("antnest: cannot write {}: {}", path.display(), e);
             status = 2;
         }
     }

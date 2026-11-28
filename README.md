@@ -1,10 +1,10 @@
-# autorouter
+# antnest
 
-A grid autorouter for KiCad boards, written in Rust. It reads a `.kicad_pcb`, routes the nets that are not yet joined, and writes the board back with the new tracks and vias. It keeps to the board's own design rules: the net classes in the `.kicad_pro` and the custom rules in the `.kicad_dru`, net pair by net pair. That is what lets it route a mains board, where mains must stay 8 mm from low voltage while two signals sit 0.2 mm apart.
+Antnest is a grid autorouter for KiCad boards, written in Rust (until version 0.10 it was simply called autorouter). It reads a `.kicad_pcb`, routes the nets that are not yet joined, and writes the board back with the new tracks and vias. It keeps to the board's own design rules: the net classes in the `.kicad_pro` and the custom rules in the `.kicad_dru`, net pair by net pair. That is what lets it route a mains board, where mains must stay 8 mm from low voltage while two signals sit 0.2 mm apart.
 
 ```bash
-cargo install --git https://github.com/Muchwat/autorouter
-autorouter my-board.kicad_pcb --drc
+cargo install --git https://github.com/Muchwat/antnest
+antnest my-board.kicad_pcb --drc
 ```
 
 It has no dependencies beyond the Rust standard library, and it runs without KiCad. KiCad's `kicad-cli` is used only for `--drc`, to check the result.
@@ -50,7 +50,7 @@ Conditions are evaluated with three values: true, false and "can't tell". Some t
 ## Usage
 
 ```
-autorouter BOARD.kicad_pcb [options]
+antnest BOARD.kicad_pcb [options]
 
   -o, --output FILE      where to write the routed board (default BOARD-routed.kicad_pcb)
       --nets A,B         route only these nets (wildcards: '/SPI_*')
@@ -130,31 +130,31 @@ Nets with a copper pour (GND, usually) are left to the pour unless you pass `--i
 A plugin for the PCB editor runs the router on the open board and puts what it lays on the board as one step that Undo takes back. Install the router, then the plugin:
 
 ```bash
-cargo install --git https://github.com/Muchwat/autorouter
+cargo install --git https://github.com/Muchwat/antnest
 ```
 
 ```bash
 python3 kicad/install.py
 ```
 
-Restart the PCB editor; **Tools > External Plugins > Autoroute** (or its toolbar button) opens a dialog with the common options: which nets, rip up first, grid, differential pairs, fan-out, plane vias, blind and buried vias, and a field for any other option. It routes the board as it stands in the editor, unsaved changes included, and pours the zones again when it is done. See [kicad/README.md](kicad/README.md) for the details, the Plugin and Content Manager package, and a way to try it from a script.
+Restart the PCB editor; **Tools > External Plugins > Antnest** (or its toolbar button) opens a dialog with the common options: which nets, rip up first, grid, differential pairs, fan-out, plane vias, blind and buried vias, and a field for any other option. It routes the board as it stands in the editor, unsaved changes included, and pours the zones again when it is done. See [kicad/README.md](kicad/README.md) for the details, the Plugin and Content Manager package, and a way to try it from a script.
 
 ### As a library
 
 ```rust
-use autorouter::{board::Board, rules::Rules, router::{route, Options}};
+use antnest::{board::Board, rules::Rules, router::{route, Options}};
 
 let board = Board::parse(std::fs::read_to_string("my.kicad_pcb")?)?;
 let rules = Rules::for_board("my.kicad_pcb", &board)?;
 let result = route(&board, &rules, &Options::default());
-std::fs::write("my-routed.kicad_pcb", autorouter::write::with_routes(&board, &result, &[]))?;
+std::fs::write("my-routed.kicad_pcb", antnest::write::with_routes(&board, &result, &[]))?;
 ```
 
 `cargo run --example pads -- board.kicad_pcb` prints every pad as the router reads it, which helps when something looks wrong.
 
 ## How well it works
 
-Five real boards, each with its tracks ripped up and routed again from nothing, then checked by KiCad 10's own DRC with the board's own rules. `autorouter-bench` produced this table (see [bench/](bench/README.md)); times are the routing alone, on one core of a 2019 Intel MacBook Pro.
+Five real boards, each with its tracks ripped up and routed again from nothing, then checked by KiCad 10's own DRC with the board's own rules. `antnest-bench` produced this table (see [bench/](bench/README.md)); times are the routing alone, on one core of a 2019 Intel MacBook Pro.
 
 | Board | Nets | Joined | Vias | Track | Time | DRC errors | Unconnected | Same on repeat |
 |---|---|---|---|---|---|---|---|---|
