@@ -240,6 +240,8 @@ pub struct Rules {
     assignments: BTreeMap<String, String>,
     patterns: Vec<(String, String)>,
     pub min_clearance: f64,
+    /// The board's least track width (Board Setup), 0 when it sets none.
+    pub min_track_width: f64,
     pub edge_clearance: f64,
     /// The least gap between the edges of two drilled holes.
     pub hole_to_hole: f64,
@@ -267,6 +269,7 @@ impl Default for Rules {
             assignments: BTreeMap::new(),
             patterns: Vec::new(),
             min_clearance: 0.0,
+            min_track_width: 0.0,
             edge_clearance: 0.5,
             hole_to_hole: 0.25,
             hole_clearance: 0.25,
@@ -345,6 +348,9 @@ impl Rules {
         if let Some(rules) = j.path(&["board", "design_settings", "rules"]) {
             if let Some(v) = rules.get("min_clearance").and_then(Json::as_f64) {
                 self.min_clearance = v;
+            }
+            if let Some(v) = rules.get("min_track_width").and_then(Json::as_f64) {
+                self.min_track_width = v;
             }
             if let Some(v) = rules.get("min_copper_edge_clearance").and_then(Json::as_f64) {
                 self.edge_clearance = v;
@@ -843,10 +849,11 @@ impl Rules {
         calls.len() <= 64
     }
 
-    /// The least width the rules allow this net's tracks (0 when no rule says).
+    /// The least width the rules allow this net's tracks: the board's least track
+    /// width, raised by any track_width rule's min (0 when neither says).
     pub fn track_floor(&self, net: &str) -> f64 {
         let it = Item::track(net);
-        let mut floor = 0.0f64;
+        let mut floor = self.min_track_width.max(0.0);
         for rule in &self.rules {
             for c in rule.constraints.iter().filter(|c| c.kind == Kind::TrackWidth) {
                 if let (Some(v), true) = (c.min, self.applies(rule, &it, &it, false) != T::No) {
@@ -1319,6 +1326,19 @@ mod tests {
     }
 
     #[test]
+    fn the_boards_least_track_width_is_a_floor() {
+        let mut r = Rules::default();
+        r.read_project(r#"{"board": {"design_settings": {"rules": {"min_track_width": 0.15}}}}"#)
+            .unwrap();
+        assert_eq!(r.min_track_width, 0.15);
+        assert_eq!(r.track_floor("ANY"), 0.15);
+        // a rule's min above it raises it for the nets it names
+        r.read_dru("(rule \"p\" (constraint track_width (min 0.3mm)) (condition \"A.NetName == 'VBUS'\"))")
+            .unwrap();
+        assert_eq!((r.track_floor("VBUS"), r.track_floor("SDA")), (0.3, 0.15));
+    }
+
+    #[test]
     fn net_classes_from_the_project() {
         let mut r = Rules::default();
         r.read_project(
@@ -1331,6 +1351,11 @@ mod tests {
         .unwrap();
         assert_eq!(r.class_of("VBUS").name, "Power");
         assert_eq!(r.class_of("+3V3").name, "Power");
+        assert_eq!(
+            (r.min_track_width, r.track_floor("SDA")),
+            (0.0, 0.0),
+            "the board sets none"
+        );
         assert_eq!(r.class_of("SDA").name, "Default");
         assert_eq!(r.track_width("+12V"), 1.0);
         assert_eq!(r.via("+12V"), Some((0.8, 0.4)));

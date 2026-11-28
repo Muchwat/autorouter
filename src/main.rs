@@ -25,8 +25,8 @@ usage: antnest BOARD.kicad_pcb [options]
       --grid MM          grid pitch, and no other is tried. Without it: the lattice the
                          board's own pads stand on (0.254 or 0.127 mm, for 0.1 inch
                          parts), else 0.25; and if anything is left unjoined, finer grids
-                         are tried (to 0.05 mm, on boards not too large for them, for
-                         five minutes at most) and the best result kept
+                         are tried (to 0.05 mm, on boards not too large for them) and the
+                         best result kept
       --margin MM        least extra gap on every clearance (default 0.02; a coarse grid
                          raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
@@ -46,7 +46,8 @@ usage: antnest BOARD.kicad_pcb [options]
                          a BGA, tight fine-pitch pads) with an escape track or a via
       --fanout-length MM how far from its pad a fan-out may end (default 2)
       --neck MM          narrowest a track may go where it is too wide to reach a pad
-                         (default: the Default class's width, or the rules' minimum if more)
+                         (default: the board's least track width; on a board that
+                         sets none, the Default class's width)
       --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
       --no-diff-pairs    route nets named as pairs (D+/D-, _P/_N) one by one, not as pairs
       --diff-pairs A,B   only these nets as pairs (wildcards; either half's name)
@@ -64,6 +65,10 @@ usage: antnest BOARD.kicad_pcb [options]
                          pour's net joins the piece cut off to the net's pour on another
                          layer, where the two lie one over the other; and a pad that
                          cannot be joined so gets a track to the rest of its net)
+      --fewer-vias       once all is routed, route each net that changes layer once more,
+                         with the others fixed and vias dearer, keeping the new way where
+                         it has fewer vias (a few percent fewer; it can leave a piece of
+                         pour the pour check misses, so use it with --drc)
       --no-tidy          leave the tracks as the grid search laid them (by default runs of
                          corners are pulled straight where every clearance allows)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
@@ -263,6 +268,7 @@ fn main() {
             }
             "--no-vias" => opt.no_vias = true,
             "--no-tidy" => opt.tidy = false,
+            "--fewer-vias" => opt.fewer_vias = true,
             "--tracks-on-planes" => opt.tracks_on_planes = true,
             "--via-in-pad" => opt.via_in_pad = true,
             "--no-diff-pairs" => opt.diff_pairs = false,
@@ -424,7 +430,8 @@ fn main() {
     let t0 = Instant::now();
     // the grid: the one asked for. Else the lattice the board's own pads stand on, or
     // 0.25 mm; and if that leaves anything unjoined, finer ones (0.2, 0.125, 0.1, 0.05 mm,
-    // while the board is not too large for them and five minutes are not up), keeping
+    // while the board is not too large for them: a limit on size, not on time, so the
+    // result is the same on any machine), keeping
     // the best (a finer grid finds ways a coarser one misses, at more time and memory)
     if !grid_given {
         if let Some(g) = router::lattice_grid(&board) {
@@ -442,7 +449,7 @@ fn main() {
         let unjoined = |r: &router::Routed| r.nets.iter().map(|n| n.unrouted.len()).sum::<usize>();
         let (bx0, by0, bx1, by1) = board.extent().unwrap_or((0.0, 0.0, 0.0, 0.0));
         for g in [0.2, 0.125, 0.1, 0.05] {
-            if unjoined(&result) == 0 || t0.elapsed().as_secs_f64() > 300.0 {
+            if unjoined(&result) == 0 {
                 break;
             }
             if g >= opt.grid - 1e-9 {

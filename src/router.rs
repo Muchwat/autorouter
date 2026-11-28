@@ -101,6 +101,11 @@ pub struct Options {
     /// after the first has cut a pour that has no other layer to be joined
     /// through; such a net is routed for these pads only, pour or no pour.
     pub mend: BTreeMap<String, Vec<String>>,
+    /// Once every net is routed, route each that changes layer once more with the
+    /// others as walls and vias dearer, keeping the new way where it has fewer vias.
+    /// Off by default: the new ways can leave a piece of pour that the pour check
+    /// does not see (a pad's thermal relief on an island), so check with --drc.
+    pub fewer_vias: bool,
     /// Pull the tracks tight once routed: runs of corners become one straight
     /// piece, or a diagonal and a straight, where every clearance allows.
     pub tidy: bool,
@@ -142,6 +147,7 @@ impl Default for Options {
             meander: 1.0,
             kept_widths: BTreeMap::new(),
             mend: BTreeMap::new(),
+            fewer_vias: false,
             tidy: true,
             progress: false,
         }
@@ -613,6 +619,9 @@ impl Work {
 }
 
 const SQRT2: f64 = std::f64::consts::SQRT_2;
+/// How much dearer a via is when each net is routed once more to take vias out.
+const VIA_SPARING: f64 = 4.0;
+
 /// How many grid steps beyond the least distance a second via may stand from the first.
 const DOUBLE_SPARE: i64 = 4;
 
@@ -4166,9 +4175,15 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
             sy1 = sy1.max(t.centre.1);
         }
         let margin = opt.margin.max(grid_margin(narrowest / 2.0 + smallest, g));
+        // (the narrowest a piece into a pad may go: as asked, else the least width the
+        // board allows, else, on a board that sets none, the Default class's width)
         let neck = opt
             .neck
-            .unwrap_or(rules.classes[0].track_width)
+            .unwrap_or(if rules.min_track_width > 0.0 {
+                0.0
+            } else {
+                rules.classes[0].track_width
+            })
             .max(rules.track_floor(&net));
         let neck = if opt.neck_length > 0.0 && neck < width - 1e-9 {
             Some(neck)
@@ -4711,6 +4726,66 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
         }
     }
 
+    // fewer vias: each net that changes layer is routed once more, with everyone
+    // else's copper as walls and a via dearer by VIA_SPARING times, and the new way
+    // is kept if it joins as much with fewer vias and not much more track. (A net
+    // that bargained for its room routes through the crowd; alone it often finds
+    // a way on one layer that was taken while the others were still moving.)
+    if opt.fewer_vias {
+        let length = |l: &Laid| -> f64 {
+            l.tracks
+                .iter()
+                .chain(l.tracks_n.iter())
+                .map(|(_, p, _)| p.windows(2).map(|s| geom::dist(s[0], s[1])).sum::<f64>())
+                .sum()
+        };
+        let (mut fewer, mut nets) = (0usize, 0usize);
+        // (again while a round takes any out: room one net gives up, another may use)
+        for _round in 0..3 {
+            let before = fewer;
+            let mut order: Vec<(usize, usize)> = (0..nj)
+                .filter(|&j| {
+                    r.active[j]
+                        && r.jobs[j].pair.is_none()
+                        && r.sibs[j].is_empty()
+                        && r.jobs[j].plane.is_empty()
+                        && r.laid[j]
+                            .as_ref()
+                            .map(|l| !l.vias.is_empty() && l.unrouted.is_empty())
+                            .unwrap_or(false)
+                })
+                .map(|j| (j, r.laid[j].as_ref().unwrap().vias.len()))
+                .collect();
+            order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            for (j, _) in order {
+                let had = r.laid[j].clone().unwrap();
+                let (vias, len) = (had.vias.len(), length(&had));
+                r.rip(j);
+                r.route_job(j, pres, opt.via_cost * VIA_SPARING, opt.limit * 4, true);
+                let better = r.laid[j]
+                    .as_ref()
+                    .map(|l| l.unrouted.is_empty() && l.vias.len() < vias && length(l) <= len * 1.3 + 2.0)
+                    .unwrap_or(false)
+                    && r.conflicts(j).is_empty();
+                if better {
+                    fewer += vias - r.laid[j].as_ref().unwrap().vias.len();
+                    nets += 1;
+                } else {
+                    r.rip(j);
+                    r.laid[j] = Some(had);
+                    r.contrib[j].clear();
+                    r.add(j, 1);
+                }
+            }
+            if fewer == before {
+                break;
+            }
+        }
+        if fewer > 0 {
+            r.say(format!("  fewer vias: {} taken out, from {} net(s)", fewer, nets));
+        }
+    }
+
     // tracks pulled tight, before lengths are tuned and second vias placed (a pair,
     // or a net routed in stretches by several jobs, keeps its tracks as they are)
     if opt.tidy {
@@ -5226,6 +5301,41 @@ mod tests {
         }
         // and the same every time
         assert_eq!(route(&b, &rules(), &Options::default()).tracks, tidy.tracks);
+    }
+
+    #[test]
+    fn routing_again_for_fewer_vias_never_costs_a_via_or_a_net() {
+        for b in [crossing(), tangle()] {
+            let keep = route(
+                &b,
+                &rules(),
+                &Options {
+                    fewer_vias: false,
+                    ..Options::default()
+                },
+            );
+            let on = Options {
+                fewer_vias: true,
+                ..Options::default()
+            };
+            let fewer = route(&b, &rules(), &on);
+            assert!(fewer.complete() && keep.complete());
+            assert!(
+                fewer.vias.len() <= keep.vias.len(),
+                "{} vias, {} without",
+                fewer.vias.len(),
+                keep.vias.len()
+            );
+            assert!(
+                smallest_gap(&b, &fewer) >= 0.2 - 1e-6,
+                "copper only {:.3} mm apart",
+                smallest_gap(&b, &fewer)
+            );
+            for n in &fewer.nets {
+                assert!(kicad_joined(&b, &fewer, &n.net), "{} is not joined", n.net);
+            }
+            assert_eq!(route(&b, &rules(), &on).tracks, fewer.tracks, "the same every time");
+        }
     }
 
     #[test]

@@ -64,8 +64,8 @@ antnest BOARD.kicad_pcb [options]
       --grid MM          grid pitch, and no other is tried. Without it: the lattice the
                          board's own pads stand on (0.254 or 0.127 mm, for 0.1 inch
                          parts), else 0.25; and if anything is left unjoined, finer grids
-                         are tried (to 0.05 mm, on boards not too large for them, for
-                         five minutes at most) and the best result kept
+                         are tried (to 0.05 mm, on boards not too large for them) and the
+                         best result kept
       --margin MM        least extra gap on every clearance (default 0.02; a coarse grid
                          raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
@@ -85,7 +85,8 @@ antnest BOARD.kicad_pcb [options]
                          a BGA, tight fine-pitch pads) with an escape track or a via
       --fanout-length MM how far from its pad a fan-out may end (default 2)
       --neck MM          narrowest a track may go where it is too wide to reach a pad
-                         (default: the Default class's width, or the rules' minimum if more)
+                         (default: the board's least track width; on a board that
+                         sets none, the Default class's width)
       --neck-length MM   longest narrowed piece (default 3; 0: never narrow)
       --no-diff-pairs    route nets named as pairs one by one, not as pairs
       --diff-pairs A,B   only these nets as pairs (wildcards; either half's name)
@@ -103,6 +104,10 @@ antnest BOARD.kicad_pcb [options]
                          pour's net joins the piece cut off to the net's pour on another
                          layer, where the two lie one over the other; and a pad that
                          cannot be joined so gets a track to the rest of its net)
+      --fewer-vias       once all is routed, route each net that changes layer once more,
+                         with the others fixed and vias dearer, keeping the new way where
+                         it has fewer vias (a few percent fewer; it can leave a piece of
+                         pour the pour check misses, so use it with --drc)
       --no-tidy          leave the tracks as the grid search laid them (by default runs of
                          corners are pulled straight where every clearance allows)
       --report FILE      write what was done as JSON (for scripts and benchmarks), with
