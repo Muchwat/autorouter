@@ -97,7 +97,8 @@ fn copper(board: &Board, routed: Option<&Routed>) -> Vec<Copper> {
     for &h in &board.holes {
         out.push((None, h, all.clone()));
     }
-    for a in &board.art {
+    // (an opening in the mask is no copper: a pour runs under it as it likes)
+    for a in board.art.iter().filter(|a| !a.mask) {
         out.push((a.net.clone(), a.shape, a.layers.clone()));
     }
     if let Some(r) = routed {

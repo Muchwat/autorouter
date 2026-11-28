@@ -112,7 +112,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             grid: 0.25,
-            margin: 0.05,
+            margin: 0.02,
             passes: 100,
             stall: 15,
             via_cost: 12.0,

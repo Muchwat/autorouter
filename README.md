@@ -12,7 +12,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 ## What it does
 
 - **Every net at once.** Nets are routed together and bargain for space (negotiated congestion, the PathFinder scheme of McMurchie and Ebeling, 1995). A spot two nets both want gets dearer each pass, and only the nets still in conflict are routed again. So the order nets come in does not decide whether a board finishes.
-- **It picks its grid.** Unless you name one, the router looks where the board's pads stand: a board of 0.1 inch parts is routed on its own lattice (0.254 or 0.127 mm), where tracks pass between the pins, and any other on 0.25 mm. If that leaves anything unjoined it tries finer grids, down to 0.1 mm on boards not too large for them, and keeps the best result. So a board the usual grid routes whole costs nothing extra, and a fine-pitch one gets the grid it needs.
+- **It picks its grid.** Unless you name one, the router looks where the board's pads stand: a board of 0.1 inch parts is routed on its own lattice (0.254 or 0.127 mm), where tracks pass between the pins, and any other on 0.25 mm. If that leaves anything unjoined it tries finer grids, down to 0.05 mm on boards not too large for them, and keeps the best result. So a board the usual grid routes whole costs nothing extra, and a fine-pitch one gets the grid it needs.
 - **Always legal.** If the passes run out with nets still in conflict, those nets are routed once more with everyone else's copper as walls. A net may be left unjoined, but tracks never overlap or break a clearance the router knows about.
 - **KiCad's rules, per net pair.** Clearance between two items is worked out the way KiCad's DRC does it: the larger net-class clearance, overridden by the last custom rule that matches, never below the board minimum.
 - **Existing copper is kept.** Pads, tracks and vias of other nets are obstacles. A net's own copper already joins what it reaches, counted the way KiCad counts it (a track's end, or a via's or pad's centre, on the other item), so only the missing links are routed. Locked items stay even with `--rip`.
@@ -30,7 +30,7 @@ It has no dependencies beyond the Rust standard library, and it runs without KiC
 - **A pour the new tracks cut is joined again.** A net left to its pour is joined by copper the router never lays, and a new track can cut that copper in two. Where a piece is cut off (with a pad on it, or any piece of a square millimetre or more if the zone keeps its islands), a via of the pour's net is put where that piece lies over the net's pour on another layer, checked against every clearance. The copper round a drilled pad counts layer by layer: boxed in on one layer it is a piece cut off, though the pad's own hole still joins it (KiCad reports that as a thermal relief on an island). Where there is no such spot (the net is poured on one layer only, or there is no room for the via), each pad the pour no longer reaches gets a track to the rest of its net instead. Only what the routing broke is mended. `--no-stitch` turns it off.
 - **It says why.** A piece left unjoined comes with a reason: no clear way in at that width, shut in by other copper with so many square millimetres of room, or no path between other nets' copper.
 - **The real board shape.** The outline (lines, arcs, circles, rectangles, polygons, Bezier curves, and edge cuts inside footprints), non-plated holes and milled slots, and keep-out areas are walls. An outline that is not closed is reported, and the board is routed without it.
-- **Words and drawings in copper are copper.** Text and graphics on a copper layer (a board's name, a label by a jumper, a drawn antenna) are kept clear of like any other copper. A footprint's graphic that touches one of its pads is taken as that pad's copper, with its net.
+- **Words and drawings in copper are copper.** Text and graphics on a copper layer (a board's name, a label by a jumper, a drawn antenna) are kept clear of like any other copper. So is an opening drawn in the solder mask (a logo in bare copper, a strip left bare): copper of two nets under one opening is a bridge to KiCad, and new tracks and vias keep out from under it; an opening that lies on a footprint's own pad is that pad's. A footprint's graphic that touches one of its pads is taken as that pad's copper, with its net.
 - **Pads are joined to their plane.** A net with a plane on an inner layer (GND, a supply) is not routed pad to pad: each of its pads that is not on the plane yet gets a short track and a via down to it, or a track to copper of the net that is on it already where that is nearer. Which pads are on the plane is worked out from the pours as they would fill, so a pad in an outer pour that is an island apart from the plane counts as not joined. The via is blind where blind vias are allowed, and no track is laid on the plane itself. `--no-plane-vias` leaves such nets alone.
 - **Any number of copper layers.** An inner layer that a pour covers is treated as a plane and kept free of tracks, unless you pass `--tracks-on-planes`. Every track starts and ends on its pad's centre.
 - **KiCad 7 to 10 files,** both the numbered nets of KiCad 7 to 9 and the named nets of KiCad 10. Only new items are added and replaced ones cut out; the rest of the file stays byte for byte as KiCad wrote it.
@@ -64,9 +64,9 @@ autorouter BOARD.kicad_pcb [options]
       --grid MM          grid pitch, and no other is tried. Without it: the lattice the
                          board's own pads stand on (0.254 or 0.127 mm, for 0.1 inch
                          parts), else 0.25; and if anything is left unjoined, finer grids
-                         are tried (to 0.1 mm, on boards not too large for them, for
+                         are tried (to 0.05 mm, on boards not too large for them, for
                          five minutes at most) and the best result kept
-      --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
+      --margin MM        least extra gap on every clearance (default 0.02; a coarse grid
                          raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
       --via D/DRILL      one via size for every net, e.g. 0.6/0.3 (default: from the rules)
@@ -123,7 +123,7 @@ The exit status is 0 when every net is joined (and, with `--drc`, KiCad finds no
 
 Nets with a copper pour (GND, usually) are left to the pour unless you pass `--include-poured`; a net with an inner plane has its pads joined to the plane (see above), and `--rip` leaves its existing tracks and vias in place either way. New tracks can cut a pour into islands. The router estimates this on a fine grid and warns when pads that the pour joined before routing are cut off after it; with `--drc`, KiCad's own fill decides. Add stitching vias, or route the poured net too.
 
-**Grid.** Walls and conflicts are tested at grid points, so a track between two points can pass a little nearer to other copper than the points do. Every clearance carries a margin for that, worked out from the grid: 0.05 mm at the default 0.25 mm, more on a coarser grid (about 0.45 mm at 1 mm). A coarse grid is safe but packs tracks loosely.
+**Grid.** Walls and conflicts are tested at grid points, so a track between two points can pass a little nearer to other copper than the points do. Every clearance carries a margin for that, worked out from the grid: about 0.05 mm at 0.25 mm, less on a finer grid (never under 0.02 mm, unless `--margin` says so), more on a coarser one (about 0.45 mm at 1 mm). A coarse grid is safe but packs tracks loosely.
 
 ### In KiCad
 
@@ -158,18 +158,18 @@ Five real boards, each with its tracks ripped up and routed again from nothing, 
 
 | Board | Nets | Joined | Vias | Track | Time | DRC errors | Unconnected | Same on repeat |
 |---|---|---|---|---|---|---|---|---|
-| Reflow-hotplate controller, 110 x 88 mm, 2 layers, 240 V mains (hand-routed mains kept) | 27 | 27 | 10 | 1196 mm | 1.0 s | 0 | 0 | yes |
-| Dispenser controller, 176 x 69 mm, 2 layers, 164 parts, ESP32-S3 and USB-C | 100 | 100 | 136 | 3548 mm | 5.6 s | 0 | 0 | yes |
-| The same, with 0.5 to 1.6 mm power and mains widths as rules | 100 | 100 | 169 | 3643 mm | 9.9 s | 0 | 0 | yes |
-| Battery-management board, 2 layers, four pours | 42 | 42 | 38 | 775 mm | 0.7 s | 0 | 0 | yes |
-| Vehicle tracker, 4 layers with two inner planes, 187 nets | 187 | 187 | 286 | 5253 mm | 29.8 s | 0 | 0 | yes |
+| Reflow-hotplate controller, 110 x 88 mm, 2 layers, 240 V mains (hand-routed mains kept) | 27 | 27 | 10 | 1194 mm | 1.6 s | 0 | 0 | yes |
+| Dispenser controller, 176 x 69 mm, 2 layers, 164 parts, ESP32-S3 and USB-C | 100 | 100 | 136 | 3546 mm | 9.6 s | 0 | 0 | yes |
+| The same, with 0.5 to 1.6 mm power and mains widths as rules | 100 | 100 | 165 | 3662 mm | 14.5 s | 0 | 0 | yes |
+| Battery-management board, 2 layers, four pours | 42 | 42 | 38 | 775 mm | 0.9 s | 0 | 0 | yes |
+| Vehicle tracker, 4 layers with two inner planes, 187 nets | 187 | 187 | 286 | 5253 mm | 37.9 s | 0 | 0 | yes |
 | **All five** | **456** | **456** | | | | **0** | **0** | |
 
 On the battery board the new tracks cut one pad off its pour on the front. The router sees that for itself and puts in one via of the pour's net, down to the same net's pour on the back, which joins the pad again; that is the 38th via. The same goes for the copper round a drilled pad: on the vehicle tracker new tracks on the back boxed in the pour round the USB socket's shield pin, which KiCad reports as a thermal relief on an island, and three vias join such pieces again there (two more on the hotplate board, where KiCad had not complained).
 
 The differential pairs on these boards are USB lines. The dispenser's run side by side for 38 mm of 55 (33 mm with the wide power tracks about), the tracker's two for 46 mm of 75 and 13 mm of 17. What is left over is the hop between the socket and its protection part, a few millimetres where the two nets come out the other way round and a pair would have to cross.
 
-On the dispenser board with real widths, three pads of the 1.2 mm supply are reached by a narrowed piece, 1.0 to 1.05 mm wide, and every via on a wide track got a second one, 21 of them. The same board routed with `--keep-widths` instead of those rules, its widths taken from the tracks it had, comes out much the same: 100 of 100 nets, 164 vias, 0 DRC errors, the same three pads narrowed.
+On the dispenser board with real widths, three pads of the 1.2 mm supply are reached by a narrowed piece, 1.0 to 1.05 mm wide, and every via on a wide track got a second one, 18 of them. The same board routed with `--keep-widths` instead of those rules, its widths taken from the tracks it had, comes out much the same: 100 of 100 nets, 164 vias, 0 DRC errors, the same three pads narrowed.
 
 Blind and buried vias were tried on the vehicle tracker, with tracks allowed on its two inner layers. With every span allowed, 194 of its 245 vias came out blind; with only neighbouring layers joined (`F.Cu-In1.Cu,In1.Cu-In2.Cu,In2.Cu-B.Cu`), 123 blind and 1 buried of 242. Both runs join all 187 nets and pass KiCad's DRC with no errors, no warnings and nothing unconnected.
 
@@ -196,13 +196,13 @@ Six of the demo boards that come with KiCad 10, each with the tracks of every ne
 | Board | This router: left open | new errors | time | Freerouting: left open | new errors | time |
 |---|---|---|---|---|---|---|
 | ecc83-pp_v2, 2 layers, 8 nets | 0 | 0 | 0.1 s | 0 | 0 | 0.5 s |
-| pic_programmer, 2 layers, 33 nets | 1 | 0 | 12 s | 1 | 27 | 19 s |
-| interf_u, 2 layers, 109 nets | 0 | 4 | 56 s | 0 | 3 | 127 s |
-| StickHub, 2 layers, 42 nets, 0.5 mm pitch | 12 | 10 | 20 s | 5 | 4 | 626 s |
-| RoyalBlue54L-Feather, 8 layers, 5 nets left to route | 2 | 0 | 24 s | 0 | 5 | 176 s |
-| kit-dev-coldfire-xilinx_5213, 4 layers, 207 nets | 2 | 0 | 266 s | no result in 25 minutes | | |
+| pic_programmer, 2 layers, 33 nets | 1 | 0 | 11 s | 1 | 27 | 19 s |
+| interf_u, 2 layers, 109 nets | 0 | 0 | 158 s | 0 | 3 | 127 s |
+| StickHub, 2 layers, 42 nets, 0.5 mm pitch | 6 | 0 | 34 s | 5 | 4 | 626 s |
+| RoyalBlue54L-Feather, 8 layers, 5 nets left to route | 2 | 0 | 16 s | 0 | 5 | 176 s |
+| kit-dev-coldfire-xilinx_5213, 4 layers, 207 nets | 1 | 0 | 196 s | no result in 25 minutes | | |
 
-Freerouting still joins more where parts are fine-pitched: on StickHub and RoyalBlue it leaves fewer connections open, and on interf_u, where both now join everything, it does so with half the vias. This router is the quicker by far and the only one to finish the largest board, and it breaks fewer rules; Freerouting's errors are mostly tracks narrower than the board allows. What this router still leaves open is pads of fine-pitch parts shut in by their neighbours' tracks. Its errors here are thermal reliefs standing on a piece of pour cut off the rest (the pad itself is joined by a track) and vias under openings drawn in the solder mask, which it does not read.
+The two are close on what they join: across the five boards both finished, this router leaves 9 connections open and Freerouting 6 (StickHub 6 to 5, RoyalBlue 2 to 0, the rest level). Freerouting uses fewer vias to get there (59 to 121 on interf_u). This router adds no rule errors on any of the six where Freerouting adds 39, mostly tracks narrower than the board allows; it is several times the quicker on all but interf_u; and it is the only one of the two to finish the largest board. What it still leaves open is pads of fine-pitch parts shut in by their neighbours' tracks.
 
 A seventh demo, video (4 layers, 369 nets), is beyond it for now: 289 nets joined in 15 minutes and 5 GB.
 

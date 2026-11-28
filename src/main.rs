@@ -25,9 +25,9 @@ usage: autorouter BOARD.kicad_pcb [options]
       --grid MM          grid pitch, and no other is tried. Without it: the lattice the
                          board's own pads stand on (0.254 or 0.127 mm, for 0.1 inch
                          parts), else 0.25; and if anything is left unjoined, finer grids
-                         are tried (to 0.1 mm, on boards not too large for them, for
+                         are tried (to 0.05 mm, on boards not too large for them, for
                          five minutes at most) and the best result kept
-      --margin MM        least extra gap on every clearance (default 0.05; a coarse grid
+      --margin MM        least extra gap on every clearance (default 0.02; a coarse grid
                          raises it by what tracks between grid points need)
       --width MM         one track width for every net (default: from the rules)
       --via D/DRILL      one via size for every net, e.g. 0.6/0.3 (default: from the rules)
@@ -423,7 +423,7 @@ fn main() {
 
     let t0 = Instant::now();
     // the grid: the one asked for. Else the lattice the board's own pads stand on, or
-    // 0.25 mm; and if that leaves anything unjoined, finer ones (0.2, 0.125, 0.1 mm,
+    // 0.25 mm; and if that leaves anything unjoined, finer ones (0.2, 0.125, 0.1, 0.05 mm,
     // while the board is not too large for them and five minutes are not up), keeping
     // the best (a finer grid finds ways a coarser one misses, at more time and memory)
     if !grid_given {
@@ -441,7 +441,7 @@ fn main() {
     if !grid_given {
         let unjoined = |r: &router::Routed| r.nets.iter().map(|n| n.unrouted.len()).sum::<usize>();
         let (bx0, by0, bx1, by1) = board.extent().unwrap_or((0.0, 0.0, 0.0, 0.0));
-        for g in [0.2, 0.125, 0.1] {
+        for g in [0.2, 0.125, 0.1, 0.05] {
             if unjoined(&result) == 0 || t0.elapsed().as_secs_f64() > 300.0 {
                 break;
             }

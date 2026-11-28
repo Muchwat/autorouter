@@ -56,6 +56,10 @@ pub struct Art {
     pub shape: Shape,
     pub layers: Vec<usize>,
     pub text: bool,
+    /// Not copper but an opening drawn in the solder mask over that layer (a
+    /// logo, a bare strip): copper of two nets under one opening is a bridge to
+    /// KiCad, so new copper keeps out from under it.
+    pub mask: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -296,7 +300,9 @@ impl Board {
                 Some(h) if h.starts_with("gr_") => {
                     let layers = layer_list(item);
                     if !layers.is_empty() {
-                        b.art_item(item, (0.0, 0.0), 0.0, layers);
+                        b.art_item(item, (0.0, 0.0), 0.0, layers, false);
+                    } else if let Some(l) = b.under_mask(item) {
+                        b.art_item(item, (0.0, 0.0), 0.0, vec![l], true);
                     }
                 }
                 _ => {}
@@ -346,7 +352,9 @@ impl Board {
                     }
                     let on_copper = layer_list(item);
                     if !on_copper.is_empty() {
-                        self.art_item(item, origin, fdeg, on_copper);
+                        self.art_item(item, origin, fdeg, on_copper, false);
+                    } else if let Some(l) = self.under_mask(item) {
+                        self.art_item(item, origin, fdeg, vec![l], true);
                     }
                     if layer == "F.CrtYd" || layer == "B.CrtYd" {
                         for key in ["start", "end", "center", "mid"] {
@@ -379,17 +387,34 @@ impl Board {
         }
         // a footprint's copper graphic that touches one of its pads is that pad's
         // copper (an antenna, a net tie, a pad drawn larger): it takes the pad's net
+        // (and an opening in the mask that lies on one of its pads is that pad's own)
+        let mut own_openings: Vec<usize> = Vec::new();
         for k in first_art..self.art.len() {
-            if self.art[k].text {
+            if self.art[k].text && !self.art[k].mask {
                 continue;
             }
-            let net = self.pads[first_pad..]
-                .iter()
-                .find(|p| {
-                    p.layers.iter().any(|l| self.art[k].layers.contains(l)) && p.shape.touches(&self.art[k].shape)
-                })
-                .and_then(|p| p.net.clone());
-            self.art[k].net = net;
+            let pad = self.pads[first_pad..].iter().find(|p| {
+                p.layers.iter().any(|l| self.art[k].layers.contains(l)) && p.shape.touches(&self.art[k].shape)
+            });
+            if self.art[k].mask {
+                if pad.is_some() {
+                    own_openings.push(k);
+                }
+            } else {
+                self.art[k].net = pad.and_then(|p| p.net.clone());
+            }
+        }
+        for k in own_openings.into_iter().rev() {
+            self.art.remove(k);
+        }
+    }
+
+    /// The outer copper layer under the mask layer an item is drawn on, if it is on one.
+    fn under_mask(&self, item: &Node) -> Option<usize> {
+        match item.child_text("layer") {
+            Some("F.Mask") => Some(0),
+            Some("B.Mask") if !self.copper.is_empty() => Some(self.copper.len() - 1),
+            _ => None,
         }
     }
 
@@ -397,7 +422,7 @@ impl Board {
     /// Text is taken as the box it fills, a little on the generous side (the
     /// strokes themselves are not worked out); a filled polygon as the box
     /// round it.
-    fn art_item(&mut self, item: &Node, origin: P, deg: f64, layers: Vec<usize>) {
+    fn art_item(&mut self, item: &Node, origin: P, deg: f64, layers: Vec<usize>, mask: bool) {
         let place = |p: P| geom::add(origin, rot(p, deg));
         let get = |k: &str| item.get(k).and_then(xy).map(&place);
         let head = item.head().unwrap_or("");
@@ -580,6 +605,7 @@ impl Board {
                 shape,
                 layers: layers.clone(),
                 text,
+                mask,
             });
         }
     }
@@ -1048,6 +1074,32 @@ mod tests {
                 a: (10.0, 14.0),
                 b: (15.0, 14.0),
                 r: 0.2
+            }
+        );
+    }
+    #[test]
+    fn openings_drawn_in_the_solder_mask_are_read() {
+        let t = r#"(kicad_pcb (version 20260206) (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (25 "Edge.Cuts" user) (38 "B.Mask" user) (39 "F.Mask" user))
+          (gr_line (start 5 5) (end 9 5) (stroke (width 0.4) (type solid)) (layer "B.Mask"))
+          (footprint "LOGO" (at 10 10) (property "Reference" "G1")
+            (fp_line (start 0 2) (end 3 2) (stroke (width 0.3) (type solid)) (layer "F.Mask")))
+          (footprint "TP" (at 20 10) (property "Reference" "TP1")
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net "A"))
+            (fp_line (start -1 0) (end 1 0) (stroke (width 0.3) (type solid)) (layer "F.Mask")))
+          (gr_rect (start 0 0) (end 30 20) (layer "Edge.Cuts")))"#;
+        let b = Board::parse(t.to_string()).unwrap();
+        // the line on the back's mask, over the back copper; the logo's, over the front;
+        // the opening on the test point's own pad is the pad's and is left out
+        assert_eq!(b.art.len(), 2, "{:?}", b.art);
+        assert!(b.art.iter().all(|a| a.mask && a.net.is_none()));
+        assert_eq!(b.art[0].layers, vec![1]);
+        assert_eq!(b.art[1].layers, vec![0]);
+        assert_eq!(
+            b.art[1].shape,
+            Shape::Capsule {
+                a: (10.0, 12.0),
+                b: (13.0, 12.0),
+                r: 0.15
             }
         );
     }
