@@ -62,7 +62,8 @@ usage: autorouter BOARD.kicad_pcb [options]
                          (default 0.8; 0: never)
       --no-stitch        do not mend a pour the new tracks cut (by default a via of the
                          pour's net joins the piece cut off to the net's pour on another
-                         layer, where the two lie one over the other)
+                         layer, where the two lie one over the other; and a pad that
+                         cannot be joined so gets a track to the rest of its net)
       --no-tidy          leave the tracks as the grid search laid them (by default runs of
                          corners are pulled straight where every clearance allows)
       --report FILE      write what was done as JSON (for scripts and benchmarks)
@@ -481,6 +482,33 @@ fn main() {
     } else {
         Vec::new()
     };
+    // what a via could not mend (the net has no pour on another layer, or there was
+    // no room): each pad its pour no longer reaches gets a track to the rest of its
+    // net, routed on top of what is there now
+    let mut mended: Vec<String> = Vec::new();
+    if stitch {
+        let cut = pour::cuts(&board, &rules, &result, opt.grid, None);
+        if !cut.is_empty() {
+            let more = Options {
+                nets: Some(cut.iter().map(|c| c.net.clone()).collect()),
+                mend: cut.iter().map(|c| (c.net.clone(), c.cut_off.clone())).collect(),
+                progress: false,
+                ..opt.clone()
+            };
+            let again = router::route(&router::with_routed(&board, &result), &rules, &more);
+            result.tracks.extend(again.tracks);
+            result.vias.extend(again.vias);
+            let still: Vec<String> = pour::cuts(&board, &rules, &result, opt.grid, None)
+                .into_iter()
+                .flat_map(|c| c.cut_off)
+                .collect();
+            mended = cut
+                .iter()
+                .flat_map(|c| c.cut_off.iter().cloned())
+                .filter(|p| !still.contains(p))
+                .collect();
+        }
+    }
     let secs = t0.elapsed().as_secs_f64();
 
     let output = output.unwrap_or_else(|| {
@@ -705,6 +733,14 @@ fn main() {
             }
         );
     }
+    if !mended.is_empty() {
+        println!(
+            "  pads their pour no longer reached, joined to their net by a track: {} ({}{})",
+            mended.len(),
+            mended.iter().take(8).cloned().collect::<Vec<String>>().join(", "),
+            if mended.len() > 8 { ", ..." } else { "" }
+        );
+    }
     // pours the new copper may have cut (an estimate on the grid; KiCad's fill decides)
     let cuts = if changed {
         pour::cuts(&board, &rules, &result, opt.grid, None)
@@ -769,7 +805,7 @@ fn main() {
         let text = format!(
             "{{\n  \"version\": {},\n  \"board\": {},\n  \"output\": {},\n  \"seconds\": {:.3},\n  \"passes\": {},\n  \
              \"nets\": {},\n  \"joined\": {},\n  \"tracks_added\": {},\n  \"track_mm\": {:.1},\n  \"vias_added\": {},\n  \"blind_vias\": {},\n  \"buried_vias\": {},\n  \
-             \"plane_nets\": {},\n  \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"stitch_vias\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
+             \"plane_nets\": {},\n  \"fanouts\": {},\n  \"fanout_vias\": {},\n  \"second_vias\": {},\n  \"vias_left_single\": {},\n  \"stitch_vias\": {},\n  \"mended_pads\": {},\n  \"items_removed\": {},\n  \"unrouted\": {},\n  \
              \"narrowed\": {},\n  \"pairs\": {},\n  \"lengths\": {},\n  \"pour_cuts\": {},\n  \"warnings\": {},\n  \"drc\": {},\n  \
              \"ripped_nets\": {},\n  \"new_tracks\": {},\n  \"new_vias\": {}\n}}\n",
             q(env!("CARGO_PKG_VERSION")),
@@ -790,6 +826,7 @@ fn main() {
             result.doubled,
             result.single.len(),
             stitches.len(),
+            mended.len(),
             removed,
             list(left
                 .iter()

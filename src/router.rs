@@ -95,6 +95,12 @@ pub struct Options {
     /// the rules' least): the widths the board's own tracks had, from
     /// `board_widths`, so a net taken up and routed again keeps its width.
     pub kept_widths: BTreeMap<String, f64>,
+    /// Pads a pour no longer reaches, by net: each is joined by a track to the
+    /// copper of its net that the pour still does reach (the rest of the net's
+    /// pads count as one piece, as the pour makes them). For a second routing,
+    /// after the first has cut a pour that has no other layer to be joined
+    /// through; such a net is routed for these pads only, pour or no pour.
+    pub mend: BTreeMap<String, Vec<String>>,
     /// Pull the tracks tight once routed: runs of corners become one straight
     /// piece, or a diagonal and a straight, where every clearance allows.
     pub tidy: bool,
@@ -135,6 +141,7 @@ impl Default for Options {
             match_groups: Vec::new(),
             meander: 1.0,
             kept_widths: BTreeMap::new(),
+            mend: BTreeMap::new(),
             tidy: true,
             progress: false,
         }
@@ -3511,6 +3518,35 @@ pub fn wanted(board: &Board, opt: &Options, net: &str) -> bool {
     opt.include_poured || !board.poured_nets().iter().any(|p| p == net)
 }
 
+/// The board with what was routed added to it as copper it already has, for
+/// routing more on top of it.
+pub fn with_routed(board: &Board, routed: &Routed) -> Board {
+    let mut b = board.clone();
+    for t in &routed.tracks {
+        b.tracks.push(crate::board::Track {
+            net: Some(t.net.clone()),
+            layer: t.layer,
+            a: t.a,
+            b: t.b,
+            width: t.width,
+            locked: false,
+            span: (0, 0),
+        });
+    }
+    for v in &routed.vias {
+        b.vias.push(crate::board::Via {
+            net: Some(v.net.clone()),
+            at: v.at,
+            diameter: v.diameter,
+            drill: v.drill,
+            layers: v.layers,
+            locked: false,
+            span: (0, 0),
+        });
+    }
+    b
+}
+
 /// The grid a board's own pads stand on, if they do: 0.254 mm where four pads
 /// in five are on that lattice, 0.127 mm where two in five are (a board of
 /// 0.1 inch parts, laid out in mils). On such a board tracks on the same
@@ -3950,7 +3986,9 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
             out.skipped.push((net, "skipped as asked".into()));
             continue;
         }
-        if poured.contains(&net) && !opt.include_poured && own_planes.is_empty() {
+        // (a net with pads its pour no longer reaches is routed for those pads)
+        let mending = opt.mend.get(&net).filter(|_| own_planes.is_empty());
+        if poured.contains(&net) && !opt.include_poured && own_planes.is_empty() && mending.is_none() {
             out.skipped.push((net, "has a copper pour".into()));
             continue;
         }
@@ -4002,6 +4040,42 @@ fn route_inner(board: &Board, rules: &Rules, opt: &Options, stage: Stage) -> Rou
             })
             .collect();
         let mut terminals = terminals;
+        if let Some(stranded) = mending {
+            // the pads the pour still joins are one piece; each stranded pad (with any
+            // copper of its own) is a piece to join to it; a pad that was apart from
+            // the pour before all this is left out
+            let on_main = crate::pour::on_main(board, rules, &net, g);
+            let net_pads: Vec<&crate::board::Pad> = board
+                .pads
+                .iter()
+                .filter(|p| p.net.as_deref() == Some(net.as_str()))
+                .collect();
+            let mut loose: Vec<Terminal> = Vec::new();
+            let mut rest: Vec<(Shape, Vec<usize>, bool)> = Vec::new();
+            for t in terminals {
+                let (mut is_stranded, mut is_main) = (false, false);
+                for part in t.parts.iter().filter(|part| part.2) {
+                    if let Some(k) = net_pads.iter().position(|p| p.shape.centre() == part.0.centre()) {
+                        is_stranded |= stranded.contains(&net_pads[k].name());
+                        is_main |= on_main[k];
+                    }
+                }
+                if is_stranded {
+                    loose.push(t);
+                } else if is_main {
+                    rest.extend(t.parts);
+                }
+            }
+            if loose.is_empty() || rest.is_empty() {
+                continue;
+            }
+            let the_pour = Terminal {
+                label: format!("the rest of the {} pour", net),
+                centre: loose[0].centre,
+                parts: rest,
+            };
+            terminals = std::iter::once(the_pour).chain(loose).collect();
+        }
         if !own_planes.is_empty() {
             // which pads the net's copper joins to the plane as it stands: through
             // the plane itself, a via down to it, or a pour that is joined to it. (A
@@ -5244,6 +5318,48 @@ mod tests {
         assert_eq!(lattice_grid(&board(2.0, 5.0)), None);
         // too few pads to say
         assert_eq!(lattice_grid(&pair_board("")), None);
+    }
+
+    #[test]
+    fn a_pad_its_pour_no_longer_reaches_gets_a_track() {
+        // GND is poured on the front only; another net's track right across cuts pad
+        // B's side off. There is no pour on the back to join it through: it gets a
+        // track to the rest of its net, over the other track by way of the back
+        let s = String::from(HEAD)
+            + &smd("A", "GND", 3.0, 5.0, 1.0, 1.0)
+            + &smd("C", "GND", 6.0, 5.0, 1.0, 1.0)
+            + &smd("B", "GND", 17.0, 5.0, 1.0, 1.0)
+            + "(segment (start 12 0.5) (end 12 9.5) (width 0.25) (layer \"F.Cu\") (net \"S\"))\n"
+            + &smd("S1", "S", 12.0, 0.5, 0.5, 0.5)
+            + &smd("S2", "S", 12.0, 9.5, 0.5, 0.5)
+            + "(zone (net \"GND\") (layer \"F.Cu\") (connect_pads (clearance 0.3)) (min_thickness 0.25)\n\
+               (polygon (pts (xy 0.5 0.5) (xy 19.5 0.5) (xy 19.5 9.5) (xy 0.5 9.5))))\n"
+            + "(gr_rect (start 0 0) (end 20 10) (layer \"Edge.Cuts\")))";
+        let b = Board::parse(s).unwrap();
+        // left to itself the net is its pour's business
+        let plain = route(&b, &rules(), &Options::default());
+        assert!(plain.tracks.is_empty() && plain.skipped.iter().any(|(n, _)| n == "GND"));
+        let opt = Options {
+            mend: [("GND".to_string(), vec!["B.1".to_string()])].into_iter().collect(),
+            ..Options::default()
+        };
+        let r = route(&b, &rules(), &opt);
+        assert!(r.complete(), "{:?}", r.nets);
+        assert!(r.tracks.iter().all(|t| t.net == "GND") && !r.tracks.is_empty());
+        assert_eq!(r.vias.len(), 2, "over the other track and back: {:?}", r.vias);
+        assert!(
+            smallest_gap(&b, &r) >= 0.2 - 1e-6,
+            "copper only {:.3} mm apart",
+            smallest_gap(&b, &r)
+        );
+        // B is joined to A or C by copper now; A and C, which the pour joins, got no track between them
+        let end_on = |at: P| r.tracks.iter().any(|t| t.a == at || t.b == at);
+        assert!(end_on((17.0, 5.0)), "{:?}", r.tracks);
+        assert!(
+            end_on((3.0, 5.0)) != end_on((6.0, 5.0)),
+            "one track, to one of the two: {:?}",
+            r.tracks
+        );
     }
 
     #[test]

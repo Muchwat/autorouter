@@ -312,6 +312,20 @@ pub fn on_plane(board: &Board, rules: &Rules, net: &str, planes: &[usize], grid:
     of_pad.iter().map(|id| id.is_some() && *id == plane).collect()
 }
 
+/// For each pad of `net`, in the board's order: whether it is on the largest
+/// piece of the net's copper as it stands (pours, tracks, vias), the piece the
+/// pour is taken to join.
+pub fn on_main(board: &Board, rules: &Rules, net: &str, grid: f64) -> Vec<bool> {
+    let pads = board.pads.iter().filter(|p| p.net.as_deref() == Some(net)).count();
+    let gr = match fine_grid(board, grid) {
+        Some(g) => g,
+        None => return vec![false; pads],
+    };
+    let (of_pad, sizes) = pieces(board, rules, net, &copper(board, None), &gr);
+    let main = sizes.iter().enumerate().max_by_key(|(_, s)| **s).map(|(i, _)| i as u32);
+    of_pad.iter().map(|id| id.is_some() && *id == main).collect()
+}
+
 /// The grid the pours are worked out on.
 fn fine_grid(board: &Board, grid: f64) -> Option<Grid> {
     let (bx0, by0, bx1, by1) = board.extent()?;
